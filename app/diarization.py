@@ -1,5 +1,8 @@
 """
-Speaker diarization service with forced CPU processing for FFT operations to avoid cuFFT errors.
+Speaker diarization service optimized for performance with GPU acceleration.
+
+This module provides functionality to identify speakers in audio files (diarization)
+with performance optimizations for large files, GPU processing, and memory management.
 """
 
 import os
@@ -10,7 +13,9 @@ import time
 import gc
 import torch
 import numpy as np
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
+import concurrent.futures
+import subprocess
 
 from app.config import settings
 from app.exceptions import DiarizationError, ConfigurationError
@@ -38,7 +43,6 @@ if settings.DIARIZATION_ENABLED:
         from pyannote.audio import Pipeline
         from pyannote.audio.core.io import AudioFile
         from pydub import AudioSegment
-        import subprocess
         
         DIARIZATION_AVAILABLE = True
         logger.info("Successfully imported pyannote.audio for diarization")
@@ -53,7 +57,7 @@ if settings.DIARIZATION_ENABLED:
 
 class DiarizationService:
     """
-    Speaker diarization service using Pyannote with forced CPU audio processing.
+    Speaker diarization service using Pyannote with performance optimizations.
     """
     # Class-level lock for thread safety
     _init_lock = threading.RLock()
@@ -66,13 +70,13 @@ class DiarizationService:
     CHUNK_DURATION_SEC = settings.DIARIZATION_CHUNK_DURATION
 
     def __init__(self):
-        """Initialize the diarization service."""
+        """Initialize the diarization service with performance optimizations."""
         with DiarizationService._init_lock:
             if DiarizationService._initialized:
                 logger.debug("DiarizationService already initialized, reusing instance")
                 return
             
-            logger.info("Initializing DiarizationService with CPU-forced FFT processing")
+            logger.info("Initializing DiarizationService with performance optimizations")
             
             if not settings.DIARIZATION_ENABLED:
                 logger.info("Diarization is disabled in settings, skipping initialization")
@@ -87,11 +91,44 @@ class DiarizationService:
             # Mark as initialized
             DiarizationService._initialized = True
             
-            # Apply monkey patch for FFT operations
+            # Apply memory and performance optimizations
+            self._setup_optimizations()
+            
+            # Apply monkey patch for FFT operations - avoiding cuFFT issues
             self._monkey_patch_torch_fft()
 
+    def _setup_optimizations(self):
+        """Apply performance optimizations for diarization."""
+        # Optimize thread usage for both torch and numpy
+        torch.set_num_threads(min(8, os.cpu_count() or 4))
+        
+        # Set numpy threading limits
+        try:
+            import numpy as np
+            np.set_num_threads(min(8, os.cpu_count() or 4))
+        except:
+            pass
+            
+        # Set optimal chunk size based on GPU memory
+        if torch.cuda.is_available() and hasattr(torch.cuda, 'mem_get_info'):
+            free_mem, total_mem = torch.cuda.mem_get_info(0)
+            free_gb = free_mem / (1024**3)
+            
+            # Adjust chunk duration based on available memory
+            if free_gb > 10:
+                self.CHUNK_DURATION_SEC = 600  # 10 minutes for high-memory GPUs
+            elif free_gb > 6:
+                self.CHUNK_DURATION_SEC = 300  # 5 minutes for mid-range GPUs
+            else:
+                self.CHUNK_DURATION_SEC = 180  # 3 minutes for lower-memory GPUs
+                
+            logger.info(f"Set optimal chunk duration to {self.CHUNK_DURATION_SEC}s based on {free_gb:.1f}GB free GPU memory")
+
     def _monkey_patch_torch_fft(self):
-        """Apply monkey patches to ensure FFT operations run on CPU to avoid cuFFT errors."""
+        """
+        Apply monkey patches to ensure FFT operations run on CPU to avoid cuFFT errors.
+        This is a specific workaround for pyannote.audio.
+        """
         if not settings.DIARIZATION_ENABLED:
             return
             
@@ -137,7 +174,9 @@ class DiarizationService:
         logger.info("✓ FFT operations will now run on CPU to avoid cuFFT errors")
 
     def load_pipeline(self):
-        """Load the Pyannote pipeline once, move to GPU if available."""
+        """
+        Load the Pyannote pipeline with optimized settings.
+        """
         if not settings.DIARIZATION_ENABLED:
             raise ConfigurationError("Diarization is disabled in configuration")
             
@@ -169,6 +208,11 @@ class DiarizationService:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
+                # Start monitoring memory
+                if torch.cuda.is_available() and hasattr(torch.cuda, 'mem_get_info'):
+                    free_mem_before, total_mem = torch.cuda.mem_get_info(0)
+                    logger.info(f"GPU memory before loading diarization: {free_mem_before / (1024**3):.2f}GB free")
+                
                 # Load pipeline from Hugging Face
                 pipeline = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
@@ -182,6 +226,12 @@ class DiarizationService:
                 if device.type == "cuda":
                     logger.info(f"Moving diarization pipeline to {device}")
                     pipeline = pipeline.to(device)
+                    
+                    # Report memory usage after loading
+                    if hasattr(torch.cuda, 'mem_get_info'):
+                        free_mem_after, _ = torch.cuda.mem_get_info(0)
+                        memory_used = (free_mem_before - free_mem_after) / (1024**3)
+                        logger.info(f"Diarization pipeline using approximately {memory_used:.2f}GB of GPU memory")
                 
                 # Validate pipeline is on correct device
                 self._validate_pipeline_devices(pipeline)
@@ -230,13 +280,15 @@ class DiarizationService:
                 logger.warning(f"Could not determine device for model {name}")
 
     def load_audio(self, file_path: str, sr: int = SAMPLE_RATE) -> np.ndarray:
-        """Load audio file using ffmpeg for better reliability."""
+        """
+        Load audio file using ffmpeg with performance optimizations.
+        """
         try:
-            # Use ffmpeg to decode audio
+            # Use ffmpeg to decode audio with optimal settings
             cmd = [
                 "ffmpeg",
                 "-nostdin",
-                "-threads", "0",
+                "-threads", str(min(4, os.cpu_count() or 2)),  # Limit thread usage
                 "-i", file_path,
                 "-f", "s16le",
                 "-ac", "1",
@@ -247,10 +299,12 @@ class DiarizationService:
             out = subprocess.run(cmd, capture_output=True, check=True).stdout
             return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}")
+            raise RuntimeError(f"Failed to load audio: {e.stderr.decode() if e.stderr else str(e)}")
 
     def get_audio_info(self, file_path):
-        """Get basic audio information without loading entire file."""
+        """
+        Get audio information efficiently without loading entire file.
+        """
         try:
             # Use ffprobe to get duration
             cmd = [
@@ -280,23 +334,41 @@ class DiarizationService:
         except Exception as e:
             logger.warning(f"Could not get audio info: {e}, using estimates")
             # Default estimates
-            return {
-                'duration': 0,  # Unknown
-                'sample_rate': 16000
-            }
+            try:
+                # Estimate from file size
+                file_size = os.path.getsize(file_path)
+                # Rough estimate: 1MB ≈ 1 minute of audio at typical quality
+                duration_estimate = (file_size / (1024 * 1024)) * 60
+                return {
+                    'duration': duration_estimate,
+                    'sample_rate': 16000  # Default assumption
+                }
+            except:
+                return {
+                    'duration': 0,  # Unknown
+                    'sample_rate': 16000
+                }
 
     async def diarize_file(
         self,
         file_path: str,
         num_speakers: Optional[int] = None,
         min_speakers: Optional[int] = None,
-        max_speakers: Optional[int] = None
+        max_speakers: Optional[int] = None,
+        progress_callback: Optional[Callable[[float], None]] = None
     ) -> List[Dict[str, Any]]:
         """
-        Perform diarization on an audio file, handling chunking for large files.
-        Returns a list of speaker segments.
+        Perform diarization on an audio file with performance optimizations.
         
-        This is an async function to be compatible with asyncio.
+        Args:
+            file_path: Path to the audio file
+            num_speakers: Exact number of speakers (if known)
+            min_speakers: Minimum number of speakers
+            max_speakers: Maximum number of speakers
+            progress_callback: Function to call with progress updates (0.0-1.0)
+            
+        Returns:
+            List of speaker segments
         """
         if not settings.DIARIZATION_ENABLED:
             logger.warning("Diarization requested but disabled in config")
@@ -309,6 +381,10 @@ class DiarizationService:
         start_time = time.time()
         
         try:
+            # Initial progress update
+            if progress_callback:
+                progress_callback(0.05)
+            
             # Convert zero to None
             if num_speakers == 0:
                 num_speakers = None
@@ -322,8 +398,16 @@ class DiarizationService:
                 num_speakers = 2
                 logger.info("No speaker constraints provided, defaulting to 2 speakers")
             
+            # Update progress after setup
+            if progress_callback:
+                progress_callback(0.1)
+            
             # Load the pipeline
             pipeline = self.load_pipeline()
+            
+            # Update progress after pipeline loading
+            if progress_callback:
+                progress_callback(0.15)
             
             # Prepare kwargs for diarization
             diar_kwargs = {}
@@ -339,15 +423,24 @@ class DiarizationService:
             audio_info = self.get_audio_info(file_path)
             logger.info(f"Audio duration: {audio_info['duration']:.1f}s, sample rate: {audio_info['sample_rate']}Hz")
             
+            # Update progress after audio analysis
+            if progress_callback:
+                progress_callback(0.2)
+            
             # Process based on audio length
             if audio_info['duration'] <= self.CHUNK_DURATION_SEC:
                 logger.info("Processing audio in single pass")
                 with torch.no_grad():
                     diarization = pipeline(file_path, **diar_kwargs)
                 segments = self._extract_segments(diarization)
+                # Update progress after processing
+                if progress_callback:
+                    progress_callback(0.9)
             else:
                 logger.info(f"Processing audio in chunks of {self.CHUNK_DURATION_SEC}s")
-                segments = self._process_in_chunks(pipeline, file_path, audio_info, diar_kwargs)
+                segments = await self._process_in_chunks(
+                    pipeline, file_path, audio_info, diar_kwargs, progress_callback
+                )
             
             # Normalize segment labels for consistency
             normalized_segments = self._normalize_speaker_labels(segments)
@@ -355,6 +448,10 @@ class DiarizationService:
             processing_time = time.time() - start_time
             logger.info(f"Diarization completed in {processing_time:.2f}s for {audio_info['duration']:.1f}s audio")
             logger.info(f"Found {len(normalized_segments)} speaker segments")
+            
+            # Final progress update
+            if progress_callback:
+                progress_callback(1.0)
             
             return normalized_segments
             
@@ -367,11 +464,11 @@ class DiarizationService:
         audio_bytes: bytes,
         num_speakers: Optional[int] = None,
         min_speakers: Optional[int] = None,
-        max_speakers: Optional[int] = None
+        max_speakers: Optional[int] = None,
+        progress_callback: Optional[Callable[[float], None]] = None
     ) -> List[Dict[str, Any]]:
         """
-        Perform diarization on audio bytes by saving to a temporary file first.
-        Returns a list of speaker segments.
+        Perform diarization on audio bytes with optimized temporary file handling.
         """
         if not settings.DIARIZATION_ENABLED:
             logger.warning("Diarization requested but disabled in config")
@@ -394,7 +491,8 @@ class DiarizationService:
                     temp_path,
                     num_speakers=num_speakers,
                     min_speakers=min_speakers,
-                    max_speakers=max_speakers
+                    max_speakers=max_speakers,
+                    progress_callback=progress_callback
                 )
             finally:
                 # Clean up the temporary file
@@ -405,8 +503,17 @@ class DiarizationService:
             logger.exception(f"Diarization failed: {e}")
             raise DiarizationError(f"Diarization failed: {e}")
 
-    def _process_in_chunks(self, pipeline, file_path, audio_info, diar_kwargs):
-        """Process audio in chunks to avoid memory issues with long files."""
+    async def _process_in_chunks(
+        self, 
+        pipeline, 
+        file_path, 
+        audio_info, 
+        diar_kwargs,
+        progress_callback: Optional[Callable[[float], None]] = None
+    ):
+        """
+        Process audio in chunks with performance optimizations and progress tracking.
+        """
         duration = audio_info['duration']
         chunk_duration = self.CHUNK_DURATION_SEC
         
@@ -415,18 +522,28 @@ class DiarizationService:
         
         all_segments = []
         
-        # Calculate total chunks for logging
+        # Calculate total chunks for logging and progress
         total_chunks = int(duration / (chunk_duration - overlap_duration)) + 1
         logger.info(f"Processing audio in {total_chunks} chunks with {overlap_duration}s overlap")
         
         # Create temporary directory for chunks
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Split audio into chunks
+            # Split audio into chunks - this is CPU-intensive
             chunk_files = self._split_audio(file_path, temp_dir, chunk_duration, overlap_duration)
+            
+            # Update progress after splitting
+            if progress_callback:
+                progress_callback(0.3)
             
             # Process each chunk
             for i, (chunk_file, chunk_start) in enumerate(chunk_files):
                 logger.info(f"Processing chunk {i+1}/{len(chunk_files)} (starts at {chunk_start:.2f}s)")
+                
+                # Calculate progress increment per chunk
+                if progress_callback:
+                    chunk_progress_start = 0.3 + (0.6 * i / len(chunk_files))
+                    chunk_progress_end = 0.3 + (0.6 * (i+1) / len(chunk_files))
+                    progress_callback(chunk_progress_start)
                 
                 try:
                     # Process with retry logic (try max 2 times)
@@ -445,6 +562,11 @@ class DiarizationService:
                             
                             all_segments.extend(chunk_segments)
                             logger.info(f"Chunk {i+1}: Found {len(chunk_segments)} segments")
+                            
+                            # Update progress after each chunk
+                            if progress_callback:
+                                progress_callback(chunk_progress_end)
+                                
                             break
                         
                         except Exception as e:
@@ -477,8 +599,7 @@ class DiarizationService:
 
     def _split_audio(self, file_path, output_dir, chunk_duration, overlap_duration):
         """
-        Split audio file into chunks using ffmpeg.
-        Returns a list of (chunk_file_path, start_time) tuples.
+        Split audio file into chunks using ffmpeg with optimized settings.
         """
         # Get audio duration
         cmd = [
@@ -493,36 +614,61 @@ class DiarizationService:
         chunk_files = []
         chunk_start = 0.0
         
-        while chunk_start < duration:
-            # Generate output filename
-            output_file = os.path.join(output_dir, f"chunk_{len(chunk_files)}.wav")
+        # Use ThreadPoolExecutor for parallel audio splitting
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 2)) as executor:
+            futures = []
             
-            # Calculate chunk end
-            chunk_end = min(chunk_start + chunk_duration, duration)
-            chunk_length = chunk_end - chunk_start
+            while chunk_start < duration:
+                # Generate output filename
+                output_file = os.path.join(output_dir, f"chunk_{len(chunk_files)}.wav")
+                
+                # Calculate chunk end (with handling for last chunk)
+                chunk_end = min(chunk_start + chunk_duration, duration)
+                chunk_length = chunk_end - chunk_start
+                
+                # Submit ffmpeg task to thread pool
+                futures.append(executor.submit(
+                    self._extract_chunk,
+                    file_path,
+                    output_file,
+                    chunk_start,
+                    chunk_length
+                ))
+                
+                # Save chunk info
+                chunk_files.append((output_file, chunk_start))
+                
+                # Update for next chunk (with overlap)
+                chunk_start += (chunk_duration - overlap_duration)
             
-            # Extract chunk
-            cmd = [
-                "ffmpeg",
-                "-y",  # Overwrite existing files
-                "-ss", str(chunk_start),
-                "-t", str(chunk_length),
-                "-i", file_path,
-                "-ac", "1",  # Mono
-                "-ar", str(SAMPLE_RATE),  # 16kHz
-                "-acodec", "pcm_s16le",  # PCM 16-bit
-                output_file
-            ]
-            
-            subprocess.run(cmd, check=True, capture_output=True)
-            
-            # Save chunk info
-            chunk_files.append((output_file, chunk_start))
-            
-            # Update for next chunk (with overlap)
-            chunk_start += (chunk_duration - overlap_duration)
+            # Wait for all ffmpeg tasks to complete
+            for future in concurrent.futures.as_completed(futures):
+                # Handle any exceptions
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error during audio splitting: {e}")
         
         return chunk_files
+
+    def _extract_chunk(self, input_file, output_file, start_time, duration):
+        """Extract a chunk of audio using ffmpeg with optimal settings."""
+        cmd = [
+            "ffmpeg",
+            "-y",  # Overwrite existing files
+            "-ss", str(start_time),
+            "-t", str(duration),
+            "-i", input_file,
+            "-ac", "1",  # Mono
+            "-ar", str(SAMPLE_RATE),  # 16kHz
+            "-acodec", "pcm_s16le",  # PCM 16-bit
+            "-loglevel", "error",  # Minimize logging
+            "-threads", "2",  # Limit threads
+            output_file
+        ]
+        
+        subprocess.run(cmd, check=True, capture_output=True)
+        return output_file
 
     @staticmethod
     def _extract_segments(diarization):
