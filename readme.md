@@ -1,33 +1,63 @@
 # 🎙️ Whisper Transcription API
 
-[![Python](https://img.shields.io/badge/Python-3.10+-blue)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-green)](https://fastapi.tiangolo.com/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-CUDA-red)](https://pytorch.org/)
-[![uv](https://img.shields.io/badge/uv-Managed-green)](https://github.com/astral-sh/uv)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Docker](https://img.shields.io/badge/Docker-Supported-blue)](https://www.docker.com/)
+<div align="center">
 
-A high-performance API for audio transcription with optional speaker diarization, built with FastAPI and optimized for GPU acceleration and privacy. Designed for ease of use, maintainability, and integration, particularly for privacy-conscious users.
+[![Python](https://img.shields.io/badge/Python-3.10+-blue?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-green?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-CUDA-red?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](https://opensource.org/licenses/MIT)
+[![Docker](https://img.shields.io/badge/Docker-Supported-blue?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com/)
+
+</div>
+
+<p align="center">
+A high-performance API for audio transcription with optional speaker diarization, built with FastAPI and optimized for GPU acceleration and privacy.
+</p>
+
+<p align="center">
+  <a href="#-features">Features</a> •
+  <a href="#-quick-start">Quick Start</a> •
+  <a href="#-api-endpoints">API Endpoints</a> •
+  <a href="#-basic-usage">Usage</a> •
+  <a href="#-privacy-considerations">Privacy</a> •
+  <a href="architecture.md">Architecture</a>
+</p>
+
+---
 
 ## ✨ Features
 
-- **🚀 High-Performance Transcription**: Leverages GPU-accelerated Whisper models via `transformers`.
-- **🇸🇪 Optimized for Swedish**: Easily configure KB-Whisper models (thanks to [KBLab](https://huggingface.co/KBLab)) via `.env` for superior Swedish transcription accuracy.
-- **🔊 Speaker Identification**: Optional speaker diarization using `pyannote.audio` to identify _who_ spoke _when_.
-- **🔒 Privacy Focused**:
-  - **Automatic File Deletion**: Audio files automatically and securely deleted after processing (configurable).
-  - **Secure Storage**: Options for memory-based storage (`tmpfs`) or persistent volumes with secure directory permissions.
-  - **Anonymized Task IDs**: Uses UUIDs for task tracking.
-  - **Optional Audit Logging**: Track request metadata without logging sensitive data.
-- **⚙️ Asynchronous & Scalable**: Built with FastAPI and `asyncio`, uses a task queue (`TaskManager`) to handle concurrent requests efficiently based on configured limits (e.g., GPU VRAM).
-- **🐳 Dockerized**: Optimized multi-stage Dockerfile for production using `uv`. Includes options for GPU (NVIDIA) and CPU builds. `docker-compose.yml` provided.
-- **🔧 Configurable**: Settings managed via `.env` file and environment variables using `pydantic-settings`. Smart defaults based on detected system capabilities (e.g., GPU memory).
-- **📊 API Monitoring**: Endpoints for system status, GPU details, model status, and task queue monitoring.
-- **🎨 Enhanced Logging**: Uses `rich` for colorful, readable console logs, even in Docker.
+- **🚀 High-Performance Transcription**
+  - GPU-accelerated Whisper models via `transformers`
+  - Efficient task queue for handling concurrent requests
+
+- **🇸🇪 Optimized for Swedish**
+  - Support for KB-Whisper models by [KBLab](https://huggingface.co/KBLab)
+  - Superior Swedish transcription accuracy
+
+- **🔊 Speaker Identification**
+  - Optional speaker diarization using `pyannote.audio`
+  - Identify who spoke when in multi-speaker audio
+
+- **🔒 Privacy-Focused**
+  - Automatic file deletion after processing
+  - Secure storage options (memory-based or encrypted volumes)
+  - Anonymized task tracking with UUIDs
+  - Optional audit logging
+
+- **⚙️ Configurable & Scalable**
+  - Settings managed via `.env` file and environment variables
+  - Smart defaults based on detected system capabilities
+  - Built with FastAPI and `asyncio` for async processing
+
+- **🐳 Containerized**
+  - Optimized Docker setup with GPU support
+  - Managed dependencies using `uv`
+  - Ready-to-use docker-compose configuration
 
 ## 🙏 Special Thanks
 
-We extend our sincere gratitude to **Kungliga biblioteket (The National Library of Sweden)** for their outstanding work on the **KB-Whisper** models. Their models, trained on extensive Swedish speech data, significantly outperform standard Whisper models on Swedish tasks. This API makes it easy to utilize these models by simply changing the `DEFAULT_MODEL` setting in `.env` to `kblab-large`.
+We extend our gratitude to **Kungliga biblioteket (The National Library of Sweden)** for their outstanding work on the **KB-Whisper** models, which significantly outperform standard Whisper models on Swedish tasks.
 
 Visit [KBLab's Whisper models on Hugging Face](https://huggingface.co/KBLab) to learn more.
 
@@ -35,124 +65,116 @@ Visit [KBLab's Whisper models on Hugging Face](https://huggingface.co/KBLab) to 
 
 ### Using Docker (Recommended)
 
-This provides a consistent environment for deployment.
+1. **Clone Repository**
 
-1.  **Clone Repository:**
+   ```bash
+   git clone https://github.com/CCimen/openai-transcription-api.git
+   cd openai-transcription-api
+   ```
 
-    ```bash
-    git clone https://github.com/CCimen/openai-transcription-api.git
-    cd openai-transcription-api
-    ```
+2. **Configure Environment**
 
-2.  **Configure Environment (`.env`):**
+   ```bash
+   cp .env.example .env
+   # Edit .env file with your preferred settings
+   ```
 
-    ```bash
-    cp .env.example .env
-    nano .env # Edit the file
-    ```
+   <details>
+   <summary>Key settings to review</summary>
 
-    **Key settings to review:**
+   - `API_AUTH_REQUIRED=true` (Recommended) 
+   - `API_KEY=<your-secret-key>` (Generate with: `python -c 'import secrets; print(secrets.token_urlsafe(32))'`)
+   - `HUGGINGFACE_TOKEN=<your-token>` (Required for diarization)
+   - `DEFAULT_MODEL=kblab-large` (or other model key)
+   - `AUTO_DELETE_AFTER_COMPLETION=true` (Privacy recommendation)
+   - `MAX_CONCURRENT_TASKS=1` (Adjust based on GPU VRAM)
 
-    - `API_AUTH_REQUIRED=true` (Recommended) & `API_KEY` (Generate: `python -c 'import secrets; print(secrets.token_urlsafe(32))'`)
-    - `HUGGINGFACE_TOKEN` (Required if `DIARIZATION_ENABLED=true`. Get from [HF Settings](https://huggingface.co/settings/tokens)).
-    - `DEFAULT_MODEL`: e.g., `kblab-large`, `large`, `medium`. See `app/config.py` for keys.
-    - `AUTO_DELETE_AFTER_COMPLETION=true` (Recommended for privacy).
-    - `UPLOAD_DIR`, `RESULTS_DIR`: Match `docker-compose.yml` volumes or `tmpfs` paths.
-    - `MAX_CONCURRENT_TASKS`: Adjust based on your GPU VRAM (see `.env.example` comments).
+   </details>
 
-3.  **Build & Run (Docker Compose):**
+3. **Build & Run**
 
-    - **GPU Version:** (Requires NVIDIA Drivers & Container Toolkit)
-      ```bash
-      docker compose build whisper-api
-      docker compose up -d whisper-api
-      ```
-    - **CPU Version:**
-      ```bash
-      docker compose build --build-arg BASE_IMAGE=python:3.10-slim whisper-api
-      docker compose up -d whisper-api
-      ```
+   **GPU Version:**
+   ```bash
+   docker compose build whisper-api
+   docker compose up -d whisper-api
+   ```
 
-4.  **Access API:**
-    - Docs: `http://localhost:8000/docs` (or your `${PORT}`)
-    - Health: `http://localhost:8000/health/`
+   **CPU Version:**
+   ```bash
+   docker compose build --build-arg BASE_IMAGE=python:3.10-slim whisper-api
+   docker compose up -d whisper-api
+   ```
 
-### Local Development (using `uv`)
+4. **Access API**
+   - Documentation: `http://localhost:8000/docs`
+   - Health check: `http://localhost:8000/health/`
 
-1.  **Clone Repository & Install `uv`:** (See [astral.sh/uv](https://astral.sh/uv))
-2.  **Create & Activate Virtual Environment:**
-    ```bash
-    uv venv
-    source .venv/bin/activate # Or relevant activation command
-    ```
-3.  **Install Dependencies:**
-    - **CPU-only (+ Diarization):** `uv pip install -e ".[diarization]"`
-    - **GPU (+ Diarization):** Install PyTorch+CUDA first (see [pytorch.org](https://pytorch.org/)), then `uv pip install -e ".[diarization]"`. Example (CUDA 11.8):
-      ```bash
-      uv pip install torch==2.1.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu118
-      uv pip install -e ".[diarization]"
-      ```
-4.  **Configure Environment (`.env`):** (As in Docker section)
-5.  **Install FFmpeg:** (System dependency: `sudo apt install ffmpeg`, `brew install ffmpeg`, etc.)
-6.  **Run API:**
-    ```bash
-    python app/cli.py --port 8000 # Or use --reload for dev
-    ```
-7.  **Access API:** `http://localhost:8000/docs`
+### Local Development
 
-## 🔧 Requirements
+<details>
+<summary>Setup instructions for local development</summary>
 
-- Python 3.10+
-- `uv` (for local setup)
-- Docker & Docker Compose (for container deployment)
-- NVIDIA GPU + Drivers + Container Toolkit (for GPU in Docker)
-- FFmpeg (system dependency)
-- Hugging Face Token (if using diarization)
+1. **Clone Repository & Install Dependencies**
 
-## ⚙️ Configuration (`.env`)
+   ```bash
+   git clone https://github.com/CCimen/openai-transcription-api.git
+   cd openai-transcription-api
+   
+   # Install uv (if not already installed)
+   # See https://astral.sh/uv for installation instructions
+   
+   # Create virtual environment
+   uv venv
+   source .venv/bin/activate
+   
+   # Install dependencies (CPU-only + Diarization)
+   uv pip install -e ".[diarization]"
+   
+   # For GPU support (example with CUDA 11.8)
+   uv pip install torch==2.1.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu118
+   uv pip install -e ".[diarization]"
+   ```
 
-Key settings explained (see `.env.example` for all):
+2. **Configure Environment**
+   ```bash
+   cp .env.example .env
+   # Edit .env file with your preferred settings
+   ```
 
-| Variable                       | Description                                                                      | Example            |
-| :----------------------------- | :------------------------------------------------------------------------------- | :----------------- |
-| `DEFAULT_MODEL`                | Model to use by default (`tiny`, `small`, `medium`, `large`, `kblab-large`)      | `kblab-large`      |
-| `USE_CUDA`                     | Use GPU if available (`true`/`false`)                                            | `true`             |
-| `MAX_CONCURRENT_TASKS`         | Max simultaneous processing tasks (adjust based on VRAM)                         | `1`                |
-| `DIARIZATION_ENABLED`          | Globally enable/disable speaker diarization                                      | `true`             |
-| `HUGGINGFACE_TOKEN`            | **Required** for diarization models from Hugging Face                            | `hf_YourTokenHere` |
-| `API_AUTH_REQUIRED`            | Enable API Key authentication (`true`/`false`)                                   | `true`             |
-| `API_KEY`                      | Secret key if auth is enabled                                                    | `YourGeneratedKey` |
-| `UPLOAD_DIR`                   | Path inside container for temporary uploads                                      | `/app/uploads`     |
-| `RESULTS_DIR`                  | Path inside container for temporary results/processing files                     | `/app/results`     |
-| `AUTO_DELETE_AFTER_COMPLETION` | **Privacy**: Delete audio files immediately after task finishes (`true`/`false`) | `true`             |
-| `JOB_CLEANUP_HOURS`            | How long to keep task _metadata_ (results) in memory (0=very short)              | `24`               |
-| `LOG_LEVEL`                    | App logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`)                          | `INFO`             |
+3. **Install FFmpeg** (System dependency)
+   ```bash
+   # Ubuntu/Debian
+   sudo apt install ffmpeg
+   
+   # macOS
+   brew install ffmpeg
+   ```
 
-## 🛡️ API Authentication
+4. **Run API**
+   ```bash
+   python app/cli.py --port 8000 # Add --reload for development
+   ```
 
-If `API_AUTH_REQUIRED=true` in `.env`:
+5. **Access API**
+   - Browse to `http://localhost:8000/docs`
 
-1.  Set a strong, unique `API_KEY` in `.env`.
-2.  Clients **must** send this key in the `X-API-Key` HTTP header.
-
-```bash
-curl -H "X-API-Key: your_secret_api_key" http://localhost:8000/system/status
-```
+</details>
 
 ## 📊 API Endpoints
 
-Access interactive documentation (Swagger UI) at `/docs`.
+Access interactive documentation at `/docs`
 
-- `/transcriptions/` (POST): Submit audio for transcription (+ optional diarization).
-- `/diarize/` (POST): Submit audio for diarization only.
-- `/transcriptions/{id}` / `/diarize/{id}` (GET): Get task results.
-- `/transcriptions/{id}/status` / `/diarize/{id}/status` (GET): Get task status/progress.
-- `/transcriptions/{id}` / `/diarize/{id}` (DELETE): Delete task record and files.
-- `/health/` (GET): Basic API health check.
-- `/system/status` (GET): Detailed system status (GPU, models, queue).
-- `/system/models` (GET): List available models and load status.
-- `/system/models/{name}/load` (POST): Request async model loading.
-- `/system/models/{name}/unload` (POST): Request model unloading.
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/transcriptions/` | POST | Submit audio for transcription |
+| `/transcriptions/{id}` | GET | Get transcription results |
+| `/transcriptions/{id}/status` | GET | Check task status |
+| `/diarize/` | POST | Submit audio for diarization only |
+| `/health/` | GET | API health check |
+| `/system/status` | GET | System status (GPU, models, queue) |
+| `/system/models` | GET | List available models and their status |
+
+For complete API documentation, see the [Architecture Document](architecture.md).
 
 ## 📖 Basic Usage
 
@@ -161,60 +183,57 @@ Access interactive documentation (Swagger UI) at `/docs`.
 ```bash
 curl -X POST "http://localhost:8000/transcriptions/" \
   -H "accept: application/json" \
-  # -H "X-API-Key: your_secret_api_key" # Add if auth enabled
+  -H "X-API-Key: your_secret_api_key" \
   -F "audio_file=@/path/to/audio.mp3" \
   -F "language=sv" \
   -F "model_size=kblab-large" \
   -F "diarization=true"
 ```
 
-**Response (Example):**
-
-```json
-{
-  "id": "generated-uuid-task-id",
-  "status": "queued", // or pending, preparing, processing
-  "progress": 0.0,
-  "queue_position": 1,
-  "error": null,
-  "model": "whisper-kblab-large"
-  // Other fields null initially
-}
-```
-
 **Check Status:**
 
 ```bash
-curl # -H "X-API-Key: your_secret_api_key" \
-  "http://localhost:8000/transcriptions/generated-uuid-task-id/status"
+curl -H "X-API-Key: your_secret_api_key" \
+  "http://localhost:8000/transcriptions/your-task-id/status"
 ```
 
-**Get Results (when status is 'completed'):**
+**Get Results:**
 
 ```bash
-curl # -H "X-API-Key: your_secret_api_key" \
-  "http://localhost:8000/transcriptions/generated-uuid-task-id"
+curl -H "X-API-Key: your_secret_api_key" \
+  "http://localhost:8000/transcriptions/your-task-id"
 ```
+
+## ⚙️ Configuration
+
+<details>
+<summary>Key configuration options (expand for details)</summary>
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `DEFAULT_MODEL` | Default model to use | `kblab-large` |
+| `USE_CUDA` | Use GPU if available | `true` |
+| `MAX_CONCURRENT_TASKS` | Max simultaneous tasks | `1` |
+| `DIARIZATION_ENABLED` | Enable speaker identification | `true` |
+| `HUGGINGFACE_TOKEN` | Token for diarization models | `hf_YourTokenHere` |
+| `API_AUTH_REQUIRED` | Enable API key authentication | `true` |
+| `AUTO_DELETE_AFTER_COMPLETION` | Delete files after processing | `true` |
+| `JOB_CLEANUP_HOURS` | How long to keep task metadata | `24` |
+
+</details>
 
 ## 🔒 Privacy Considerations
 
 This API is designed with privacy in mind:
 
-- **File Deletion**: Enable `AUTO_DELETE_AFTER_COMPLETION=true` (default is true in updated code). The TaskManager ensures the original uploaded audio and any temporary processed files (like preprocessed audio for diarization) associated with a task are securely deleted immediately after the task finishes (success, failure, or cancellation).
+- **File Deletion**: Automatically deletes audio files after processing (when enabled)
+- **Memory Storage**: Option to store files only in RAM using tmpfs
+- **Authentication**: API key support for restricted access
+- **Anonymized IDs**: Uses UUIDs for task tracking
+- **Minimal Logging**: Configurable log levels to prevent exposing sensitive data
 
-- **Storage**:
-
-  - **Memory Storage** (Recommended for Privacy): Use tmpfs mounts in `docker-compose.yml` for `UPLOAD_DIR` and `RESULTS_DIR` (e.g., pointing them to `/dev/shm/...`). This ensures audio data resides only in RAM and is gone when the container stops. Requires sufficient host RAM.
-  - **Persistent Storage**: If using standard Docker volumes, the host OS's filesystem security and encryption become important. The application creates directories with restrictive permissions (0o700), but data persists on disk until deleted by the app or volume removal.
-
-- **Task IDs**: Anonymous UUIDs are used.
-
-- **Logging**: Set `LOG_LEVEL=INFO` or `WARNING` in production. Filenames might appear in logs; sensitive payload data is avoided. Audit logs (`AUDIT_LOGGING_ENABLED=true`) track request metadata only. Ensure log file permissions are secure.
-
-- **Authentication**: Strongly recommended. Enable `API_AUTH_REQUIRED=true` and use a strong `API_KEY`.
-
-- **HTTPS**: Essential for production. Terminate TLS at a reverse proxy (Nginx, Traefik, Cloud Load Balancer) placed in front of the API container.
+For detailed security recommendations, see the [Architecture Document](architecture.md#-privacy-considerations).
 
 ## 📄 License
 
-This project is licensed under the MIT License. (You should add a LICENSE file with the MIT license text to the repository root).
+This project is licensed under the [MIT License](LICENSE).
