@@ -164,15 +164,40 @@ Visit [KBLab's Whisper models on Hugging Face](https://huggingface.co/KBLab) to 
 
 Access interactive documentation at `/docs`
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/transcriptions/` | POST | Submit audio for transcription |
-| `/transcriptions/{id}` | GET | Get transcription results |
-| `/transcriptions/{id}/status` | GET | Check task status |
-| `/diarize/` | POST | Submit audio for diarization only |
-| `/health/` | GET | API health check |
-| `/system/status` | GET | System status (GPU, models, queue) |
-| `/system/models` | GET | List available models and their status |
+### Health Checks
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health/` | API Health Check |
+
+### System & Monitoring
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/system/status` | Get Overall System Status |
+| `GET` | `/system/gpu` | Get Detailed GPU Status |
+| `GET` | `/system/models` | List Available Models |
+| `POST` | `/system/models/{model_name}/load` | Load a Model |
+| `POST` | `/system/models/{model_name}/unload` | Unload a Model |
+| `GET` | `/system/queue` | Get Task Queue Status |
+
+### Transcription
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/transcriptions/` | Submit Transcription Job |
+| `GET` | `/transcriptions/{task_id}/status` | Get Transcription Job Status |
+| `GET` | `/transcriptions/{task_id}` | Get Transcription Job Result |
+| `DELETE` | `/transcriptions/{task_id}` | Delete Transcription Job |
+
+### Diarization
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/diarize/` | Submit Diarization Only Job |
+| `GET` | `/diarize/{task_id}/status` | Get Diarization Task Status |
+| `GET` | `/diarize/{task_id}` | Get Diarization Task Result |
+| `DELETE` | `/diarize/{task_id}` | Delete Diarization Task |
 
 For complete API documentation, see the [Architecture Document](architecture.md).
 
