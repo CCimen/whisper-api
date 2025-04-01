@@ -20,8 +20,10 @@ wheels/
 .installed.cfg
 *.egg
 
-# Model files and cache
+# Model files, cache, uploads, and results
 models/
+uploads/
+results/
 
 # Environment
 .env

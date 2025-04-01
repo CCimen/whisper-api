@@ -1,529 +1,692 @@
 """
 Main FastAPI application for the Whisper Transcription API.
 
-This module provides the API endpoints for transcription and diarization
-with optimized performance, resource management, and production-ready features.
+Initializes the application, sets up middleware, lifespan management,
+exception handling, and includes API routers.
 """
 
 import os
-import uuid
-import shutil
-import tempfile
-import time
-import logging
 import asyncio
-from typing import List, Dict, Optional, Any
-from enum import Enum
+import logging
+from rich.logging import RichHandler
+from rich.console import Console
+from rich.theme import Theme
+from rich.style import Style
+from rich.panel import Panel
+from rich.text import Text
+from rich.highlighter import RegexHighlighter
+from rich.table import Table
+from rich.box import ROUNDED
+from rich.traceback import install as install_rich_traceback
+import time
+import gc
+import uuid
+import secrets
+from contextlib import asynccontextmanager
+from typing import Optional
 
-import torch
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, status, Depends, HTTPException
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.openapi.utils import get_openapi
-from fastapi.openapi.docs import get_swagger_ui_html
-from pydantic import BaseModel, Field
+from fastapi.security import APIKeyHeader
 
-from app.config import settings
-from app.transcriber import check_gpu, model_manager
-from app.processor import process_audio
-from app.diarization import DIARIZATION_AVAILABLE
-from app.exceptions import TranscriptionError, DiarizationError
+# Install rich traceback handler
+install_rich_traceback(show_locals=True)
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO if not settings.DEBUG else logging.DEBUG,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+# Custom highlighter for log messages
+class WhisperAPIHighlighter(RegexHighlighter):
+    """Custom highlighter for WhisperAPI log messages."""
+    
+    base_style = "log."
+    highlights = [
+        # Task statuses with capture groups for different styling
+        r"Status changed (?P<status_from>\w+) -> (?P<status_to>\w+)",
+        r"\[(?P<component>MODEL|PROCESSOR|TASKMGR|TASKR)\]",
+        
+        # Model references
+        r"(?P<model_tiny>whisper-kblab-tiny)",
+        r"(?P<model_small>whisper-kblab-small)",
+        r"(?P<model_medium>whisper-kblab-medium)",
+        r"(?P<model_large>whisper-kblab-large|whisper-openai-large-v3)",
+        r"(?P<model_base>whisper-base)",
+        
+        # Request information
+        r"(?P<http_method>GET|POST|DELETE|PUT) (?P<url>/[^\s]+)",
+        r"Duration=(?P<duration>\d+\.?\d*m?s)",
+        r"Status=(?P<status>\d{3})",
+        
+        # File information
+        r"(?P<file_path>/tmp/[^\s]+)",
+        r"(?P<file_size>\d+) bytes\)",
+        r"R_ID=(?P<request_id>[a-f0-9\-]+)",
+        
+        # Task IDs
+        r"task (?P<task_id>[a-f0-9\-]+)"
+    ]
+
+api_highlighter = WhisperAPIHighlighter()
+
+# Define custom theme for the console - using color-blind friendly palette
+CUSTOM_THEME = Theme({
+    # General message types
+    "info": "bold cyan",
+    "warning": "bold yellow",
+    "danger": "bold bright_red",
+    "success": "bold bright_green",
+    
+    # Application components
+    "app.title": "bold bright_magenta",
+    "app.subtitle": "italic cyan",
+    
+    # Models - using blue which is generally visible to most color-blind people
+    "model.name": "bold bright_blue",
+    "model.tiny": "bold blue",
+    "model.small": "bold cyan",
+    "model.medium": "bold blue on black",
+    "model.large": "bold bright_blue on black",
+    "model.base": "bold cyan on black",
+    "model.status": "bright_green",
+    "model.loading": "yellow",
+    "model.ready": "bold bright_green",
+    
+    # API related
+    "api.request": "bold cyan",
+    "api.response": "cyan",
+    "api.method": "bold bright_green",
+    "api.status.success": "bright_green",
+    "api.status.error": "bright_red",
+    "api.duration": "bold bright_white",
+    "api.url": "underline cyan",
+    
+    # Configuration
+    "config.key": "bold bright_blue",
+    "config.value": "bold bright_white",
+    "config.enabled": "bold bright_green",
+    "config.disabled": "italic yellow",
+    
+    # Task management - using high contrast
+    "task.id": "bold bright_yellow",
+    "task.status": "bold bright_white",
+    "task.status.change": "bold bright_yellow",
+    "taskmgr": "bold bright_blue",
+    "taskr": "bold blue",
+    "processor": "bold bright_magenta",
+    
+    # Log components
+    "log.timestamp": "dim white",
+    "log.scope": "bold bright_blue",
+    
+    # File operations
+    "file.path": "underline bright_white",
+    "file.size": "bold bright_white",
+    "file.duration": "italic bright_white",
+})
+
+# Configure logging FIRST (using RichHandler)
+logger = logging.getLogger()  # Get root logger
+# Clear existing handlers if any
+if logger.hasHandlers():
+    logger.handlers.clear()
+
+# Import exceptions FIRST so they are available for the try/except block
+try:
+    from app.exceptions import (
+        ModelNotFoundError, TranscriptionError, DiarizationError,
+        ConfigurationError, BaseApiException, FileProcessingError
+    )
+except ImportError as e:
+    print(f"[bold red]CRITICAL:[/bold red] Failed to import base exception classes: {e}. Cannot start.")
+    exit(1)
+
+# Import settings and dependencies safely within a try/except
+task_manager = None  # Initialize to None
+try:
+    from app.config import settings, WHISPER_MODEL_MAPPING
+    # Exit if settings failed to load in config.py
+    if settings is None:
+        raise ConfigurationError("Settings object failed to initialize in config.py")
+
+    # Instantiate TaskManager only *after* settings are loaded
+    from app.services.task_manager import TaskManager
+    task_manager = TaskManager()  # Now create the instance
+    from app.services.model_registry import ModelRegistry
+
+except ImportError as e:
+    print(f"[bold red]CRITICAL:[/bold red] Failed to import core modules: {e}. Please ensure all dependencies are installed and configuration is present.")
+    exit(1)
+except ConfigurationError as e:
+    print(f"[bold red]CRITICAL:[/bold red] Configuration Error on startup: {e}")
+    exit(1)
+except Exception as e:
+    print(f"[bold red]CRITICAL:[/bold red] Unexpected error during initial imports or TaskManager creation: {e}")
+    exit(1)
+
+# --- Configure Logging Handlers using Settings ---
+log_level_from_settings = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
+logger.setLevel(log_level_from_settings)  # Set level on the root logger
+
+# Create a Console instance that forces terminal output (for colors in Docker)
+force_console = Console(
+    force_terminal=True, 
+    width=120,
+    theme=CUSTOM_THEME,
+    highlight=True
 )
-logger = logging.getLogger(__name__)
 
-# Status tracking with more detailed states
-class ProcessingStatus(str, Enum):
-    """Detailed processing status for better tracking."""
-    PENDING = "pending"
-    TRANSCRIBING = "transcribing"
-    DIARIZING = "diarizing"
-    COMPLETING = "completing"
-    COMPLETED = "completed"
-    ERROR = "error"
+# Custom log formatter function
+def format_log_message(message):
+    if isinstance(message, str) and not message.startswith("["):
+        return message
+    return message
 
-# API Models
-class ModelSize(str, Enum):
-    """Available model sizes for transcription."""
-    tiny = "tiny"
-    small = "small"
-    medium = "medium"
-    large = "large"
+# Define keywords to highlight in logs
+LOG_KEYWORDS = [
+    # Task management status changes
+    "Status changed", "queued", "preparing", "processing", "completed", "failed",
+    
+    # Model components
+    "whisper-kblab-tiny", "whisper-kblab-small", "whisper-kblab-medium", "whisper-kblab-large", 
+    "whisper-base", "whisper-openai-large-v3",
+    
+    # System components
+    "[MODEL]", "[PROCESSOR]", "[TASKMGR]", "[TASKR]", "[Preload Task]",
+    
+    # Duration and metrics
+    "Duration=", "bytes)", "factor:", "Segments:", "Speakers:",
+    
+    # Request patterns
+    "GET /health", "POST /transcriptions", "Request started", "Request finished"
+]
 
-class TimestampedSegment(BaseModel):
-    """Segment of transcription with timing and optional speaker."""
-    start: float = Field(..., description="Start time of segment in seconds")
-    end: float = Field(..., description="End time of segment in seconds")
-    text: str = Field(..., description="Transcribed text for this segment")
-    speaker: Optional[str] = Field(None, description="Speaker identifier (if diarization enabled)")
+# Create and add RichHandler using the forced console
+rich_handler = RichHandler(
+    console=force_console,  # Use the console that forces colors
+    rich_tracebacks=True,
+    tracebacks_show_locals=settings.DEBUG,  # Show locals in tracebacks only if DEBUG is True
+    markup=True,  # Enable Rich markup in log messages
+    show_path=False,  # Don't show the source file path/line number
+    show_time=True,   # Show timestamp
+    show_level=True,  # Show log level
+    log_time_format="[%X]",
+    omit_repeated_times=False,
+    keywords=LOG_KEYWORDS,  # Words to highlight in log messages
+    highlighter=None,  # We'll use our custom markup instead of default highlighting
+)
 
-class TranscriptionResult(BaseModel):
-    """Complete transcription result model."""
-    id: str = Field(..., description="Unique identifier for this transcription job")
-    status: str = Field(..., description="Current processing status")
-    progress: float = Field(0.0, description="Processing progress from 0.0 to 1.0")
-    transcription: Optional[str] = Field(None, description="Full transcription text")
-    segments: Optional[List[TimestampedSegment]] = Field(None, description="Timestamped segments")
-    speakers: Optional[List[str]] = Field(None, description="List of identified speakers (if diarization enabled)")
-    duration: Optional[float] = Field(None, description="Audio duration in seconds")
-    processing_time: Optional[float] = Field(None, description="Time taken to process in seconds")
-    error: Optional[str] = Field(None, description="Error message if processing failed")
+rich_handler.setLevel(log_level_from_settings)
+logger.addHandler(rich_handler)
 
-class APIStatus(BaseModel):
-    """API status and capability information."""
-    status: str = Field(..., description="API operational status")
-    version: str = Field(..., description="API version")
-    gpu: Dict[str, Any] = Field(..., description="GPU information and status")
-    diarization: Dict[str, Any] = Field(..., description="Diarization capability status")
-    default_model: str = Field(..., description="Default transcription model")
-    models_in_memory: List[str] = Field(..., description="Currently loaded models")
+logger = logging.getLogger(__name__)  # Get specific logger for this module
+logger.info(f"[app.title]Logging configured with RichHandler.[/app.title] Level set to: [config.value]{settings.LOG_LEVEL.upper()}[/config.value]")
 
-# In-memory storage for transcription jobs
-transcription_jobs = {}
+# --- Audit Logging Setup ---
+audit_logger = None
+if settings.AUDIT_LOGGING_ENABLED:
+    try:
+        audit_logger = logging.getLogger("audit")
+        audit_logger.setLevel(logging.INFO)
+        audit_logger.propagate = False
+        log_dir = os.path.dirname(settings.AUDIT_LOG_PATH)
+        if log_dir: 
+            os.makedirs(log_dir, mode=0o700, exist_ok=True)
+        from logging.handlers import RotatingFileHandler
+        handler = RotatingFileHandler(
+            settings.AUDIT_LOG_PATH,
+            maxBytes=5*1024*1024,
+            backupCount=3,
+            encoding='utf-8'
+        )
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - R_ID:%(request_id)s - IP:%(client_ip)s - %(message)s')
+        handler.setFormatter(formatter)
+        audit_logger.addHandler(handler)
+        logger.info(f":lock: Audit logging [config.enabled]enabled[/config.enabled]. Log file: [italic]{settings.AUDIT_LOG_PATH}[/italic]")
+    except Exception as e:
+        logger.error(f":warning: [danger]Failed to configure audit logging[/danger] to {settings.AUDIT_LOG_PATH}: {e}")
+        audit_logger = None
 
-# Create FastAPI app
+# --- PyTorch & GPU Availability Check ---
+pytorch_available = False
+gpu_available = False
+try:
+    import torch
+    pytorch_available = True
+    logger.info(f":package: PyTorch version: [config.value]{torch.__version__}[/config.value]")
+    if settings.USE_CUDA:
+        if torch.cuda.is_available():
+            gpu_available = True
+            num_devices = torch.cuda.device_count()
+            logger.info(f":zap: [success]CUDA available[/success]. Found [config.value]{num_devices}[/config.value] device(s).")
+            try:
+                # Validate index before getting name
+                if settings.CUDA_DEVICE < num_devices:
+                    device_name = torch.cuda.get_device_name(settings.CUDA_DEVICE)
+                    logger.info(f":computer: Using CUDA device [config.value]{settings.CUDA_DEVICE}[/config.value]: [model.name]{device_name}[/model.name]")
+                else:
+                    logger.error(f":warning: [danger]Invalid CUDA_DEVICE index {settings.CUDA_DEVICE}[/danger] (found {num_devices}). Check config.")
+                    # Update runtime setting if invalid but devices exist
+                    if num_devices > 0:
+                        logger.warning(f":wrench: Defaulting to CUDA device 0 for runtime.")
+                        # Correct the potentially invalid setting for internal use
+                        settings.CUDA_DEVICE = 0
+                    else:
+                        # If count is 0 but is_available was true, something is wrong
+                        gpu_available = False
+                        settings.USE_CUDA = False
+                        logger.error(":x: [danger]CUDA reported available but no devices found![/danger] Forcing CPU mode.")
+            except Exception as e:
+                logger.error(f":x: [danger]Could not get properties for CUDA device {settings.CUDA_DEVICE}:[/danger] {e}")
+        else:
+            logger.warning(":warning: CUDA is enabled in settings, but [italic]torch.cuda.is_available()[/italic] is [config.disabled]False[/config.disabled]. Check PyTorch installation and drivers. API will use CPU.")
+            settings.USE_CUDA = False  # Correct setting if CUDA unavailable
+    else:
+        logger.info(":information_source: CUDA is disabled in settings. API will use CPU.")
+
+except ImportError:
+    logger.warning(":warning: [warning]PyTorch not found[/warning]. Transcription/Diarization will likely fail.")
+    torch = None
+
+
+# --- API Key Security ---
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False, description="API key for authenticating requests.")
+
+async def get_api_key(x_api_key: Optional[str] = Depends(api_key_header)):
+    """Dependency function to validate the provided API key."""
+    if not settings.API_AUTH_REQUIRED:
+        return True
+
+    if not settings.API_KEY:
+        logger.critical(":rotating_light: [danger]CRITICAL: API Authentication is required, but no API_KEY is configured![/danger]")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="API authentication misconfigured on server."
+        )
+
+    if not x_api_key:
+        logger.debug(":key: API key missing in request header.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key required.",
+            headers={"WWW-Authenticate": 'ApiKey realm="Restricted Area"'},
+        )
+
+    if not secrets.compare_digest(x_api_key, settings.API_KEY):
+        logger.warning(f":key: [warning]Invalid API key received.[/warning]")
+        await asyncio.sleep(0.1)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key.",
+            headers={"WWW-Authenticate": 'ApiKey realm="Restricted Area"'},
+        )
+
+    logger.debug(":white_check_mark: API key validated successfully.")
+    return True
+
+
+# --- Background Tasks (defined outside lifespan for clarity) ---
+
+async def preload_model_background(model_key: str):
+    """Loads a model in a background task."""
+    if not task_manager:
+        logger.error(f":x: [danger]TaskManager not available.[/danger] Cannot load model {model_key}.")
+        return
+
+    # Determine model size for styling
+    model_style = "model.name"
+    if "-tiny" in model_key:
+        model_style = "model.tiny"
+    elif "-small" in model_key:
+        model_style = "model.small"
+    elif "-medium" in model_key:
+        model_style = "model.medium"
+    elif "-large" in model_key:
+        model_style = "model.large"
+    elif "-base" in model_key:
+        model_style = "model.base"
+
+    logger.info(f"[model.loading]⏳ [Preload Task][/model.loading] Starting preload for [{model_style}]{model_key}[/{model_style}]")
+    try:
+        model = ModelRegistry.get_model(model_key)
+        if not model.is_loaded():
+            device_str = "cuda" if gpu_available and settings.USE_CUDA else "cpu"
+            await asyncio.to_thread(model.load, device=device_str)
+            logger.info(f"[model.ready]✓ [Preload Task][/model.ready] Successfully preloaded model: [{model_style}]{model_key}[/{model_style}] on [config.value]{device_str}[/config.value]")
+        else:
+            logger.info(f"[model.status]ℹ [Preload Task][/model.status] Model [{model_style}]{model_key}[/{model_style}] was already loaded.")
+    except ModelNotFoundError:
+        logger.error(f"[model.loading]❌ [Preload Task][/model.loading] Model [{model_style}]{model_key}[/{model_style}] [danger]not found[/danger] in registry.")
+    except Exception as e:
+        logger.error(f"[model.loading]❌ [Preload Task][/model.loading] [danger]Failed to preload model[/danger] [{model_style}]{model_key}[/{model_style}]: {e}")
+
+async def run_periodic_cleanup():
+    """Runs background task for cleaning up old jobs and potentially files."""
+    if not task_manager:
+        logger.error("🧹 [danger]TaskManager not available.[/danger] Periodic cleanup task cannot run.")
+        return
+
+    logger.info("🧹 [taskmgr]Periodic cleanup task started.[/taskmgr]")
+    interval_seconds = max(300, settings.AUTO_DELETE_INTERVAL_MINUTES * 60)
+    logger.info(f"⏰ Cleanup interval set to [config.value]{interval_seconds}[/config.value] seconds.")
+
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            logger.debug("🧹 Running periodic cleanup cycle...")
+
+            cleaned_tasks = task_manager.cleanup_old_tasks()
+            if cleaned_tasks > 0:
+                # Create a small table for cleanup results
+                table = Table(
+                    title="Cleanup Results", 
+                    box=ROUNDED, 
+                    title_style="bold bright_blue",
+                    border_style="bright_blue"
+                )
+                table.add_column("Action", style="bright_white")
+                table.add_column("Count", style="bright_yellow")
+                table.add_column("Status", style="bright_green")
+                
+                table.add_row(
+                    "Task Records Removed", 
+                    str(cleaned_tasks), 
+                    "✓ Complete"
+                )
+                
+                logger.info(table)
+
+            gc.collect()
+            if gpu_available and torch:
+                torch.cuda.empty_cache()
+                logger.debug("♻️ [taskmgr]Periodic GPU cache clear performed.[/taskmgr]")
+
+        except asyncio.CancelledError:
+            logger.info("🛑 [taskmgr]Periodic cleanup task stopping due to cancellation.[/taskmgr]")
+            break
+        except Exception as e:
+            logger.error(f"⚠️ [danger]Error in periodic cleanup loop:[/danger] {e}")
+            await asyncio.sleep(60)
+
+# --- Application Lifespan ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handles application startup and shutdown events using async context manager."""
+    # === Startup ===
+    start_time = time.time()
+    app_title = Text(f"--- Starting {settings.APP_NAME} v{settings.APP_VERSION} ---")
+    app_title.stylize("bold magenta")
+    logger.info(app_title)
+    
+    # Log critical settings resolved after loading .env
+    logger.info(Panel.fit(
+        f"[config.key]API Authentication Required:[/config.key] [config.value]{settings.API_AUTH_REQUIRED}[/config.value]\n"
+        f"[config.key]Diarization Enabled:[/config.key] [config.value]{settings.DIARIZATION_ENABLED}[/config.value]\n"
+        f"[config.key]Max Concurrent Tasks:[/config.key] [config.value]{settings.MAX_CONCURRENT_TASKS}[/config.value]\n"
+        f"[config.key]Default Model:[/config.key] [config.value]{settings.DEFAULT_MODEL}[/config.value]\n"
+        f"[config.key]Using CUDA:[/config.key] [config.value]{settings.USE_CUDA}[/config.value] | [config.key]GPU Available:[/config.key] [config.value]{gpu_available}[/config.value]",
+        title="[app.title]Configuration[/app.title]",
+        border_style="cyan"
+    ))
+
+    # Ensure ModelRegistry discovers models early
+    try:
+        ModelRegistry.discover_models()
+        available_models = ModelRegistry.available_models()
+        logger.info(f":mag: Available models discovered: [model.name]{', '.join(available_models)}[/model.name]")
+    except Exception as e:
+        logger.error(f":x: [danger]Failed during model discovery:[/danger] {e}")
+
+    # Preload default model if configured
+    preload_task = None
+    if settings.PRELOAD_DEFAULT_MODEL and settings.DEFAULT_MODEL:
+        model_key = f"whisper-{settings.DEFAULT_MODEL}"
+        if model_key in ModelRegistry.available_models():
+            logger.info(f":hourglass: Initiating preload for default model: [model.name]{model_key}[/model.name]...")
+            preload_task = asyncio.create_task(preload_model_background(model_key))
+        else:
+            logger.warning(f":warning: Default model '[model.name]{settings.DEFAULT_MODEL}[/model.name]' (key: [model.name]{model_key}[/model.name]) specified for preload but [warning]not found in registry[/warning]. Available: [model.name]{', '.join(ModelRegistry.available_models())}[/model.name]")
+
+    # Start periodic cleanup task
+    cleanup_task = asyncio.create_task(run_periodic_cleanup())
+
+    startup_duration = time.time() - start_time
+    logger.info(f":rocket: [success]Application startup complete[/success] ([config.value]{startup_duration:.2f}s[/config.value])")
+
+    yield  # Application runs here
+
+    # === Shutdown ===
+    shutdown_title = Text(f"--- Shutting down {settings.APP_NAME} ---")
+    shutdown_title.stylize("bold yellow")
+    logger.info(shutdown_title)
+    shutdown_start_time = time.time()
+
+    # 1. Signal TaskManager to shut down
+    if task_manager:
+        logger.info(":gear: Initiating TaskManager shutdown...")
+        await task_manager.shutdown()
+        logger.info(":white_check_mark: TaskManager shutdown complete.")
+    else:
+        logger.warning(":warning: [warning]TaskManager not available during shutdown sequence.[/warning]")
+
+    # 2. Cancel background tasks
+    if preload_task and not preload_task.done():
+        preload_task.cancel()
+        logger.info(":stop_sign: Cancelled ongoing preload task.")
+    if cleanup_task and not cleanup_task.done():
+        cleanup_task.cancel()
+        try:
+            await asyncio.wait_for(cleanup_task, timeout=5.0)
+        except asyncio.CancelledError:
+            logger.info(":white_check_mark: Periodic cleanup task cancelled successfully.")
+        except asyncio.TimeoutError:
+            logger.warning(":hourglass: [warning]Periodic cleanup task did not finish within timeout during shutdown.[/warning]")
+        except Exception as e:
+            logger.error(f":x: [danger]Error waiting for cleanup task during shutdown:[/danger] {e}")
+
+    # 3. Unload all models
+    try:
+        ModelRegistry.unload_all()
+    except Exception as e:
+        logger.error(f":x: [danger]Error unloading models during shutdown:[/danger] {e}")
+
+    # 4. Final memory cleanup
+    gc.collect()
+    if gpu_available and torch:
+        try:
+            torch.cuda.empty_cache()
+            logger.info(":recycle: Final GPU cache clear performed.")
+        except Exception as e:
+            logger.warning(f":warning: [warning]Error during final GPU cache clear:[/warning] {e}")
+
+    shutdown_duration = time.time() - shutdown_start_time
+    logger.info(f":white_check_mark: [success]Application shutdown complete[/success] ([config.value]{shutdown_duration:.2f}s[/config.value])")
+
+
+# --- FastAPI App Initialization ---
 app = FastAPI(
-    title="Whisper Transcription API",
-    description="API for transcribing audio files using KB-Whisper models with optional speaker diarization",
-    version="1.0.0",
-    docs_url=None,  # Custom docs URL below
-    redoc_url=None  # Disable ReDoc
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description="High-performance API for audio transcription with optional speaker diarization using Whisper models. Optimized for privacy and GPU acceleration.",
+    lifespan=lifespan,
 )
 
-# Add performance middleware
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+# --- Middleware Configuration ---
+# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For production, specify exact domains
+    allow_origins=settings.ALLOWED_HOSTS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-    max_age=86400,  # Cache preflight requests for 24 hours
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["*", "X-API-Key", "Authorization", "Content-Type"],
 )
-
-# Custom OpenAPI documentation
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
+# GZip Middleware
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+# Security Headers Middleware
+@app.middleware("http")
+async def add_security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+# Request ID and Logging Context Middleware
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
+    request.state.client_ip = request.client.host if request.client else "unknown"
+    start_time = time.time()
     
-    openapi_schema = get_openapi(
-        title="Whisper Transcription API",
-        version="1.0.0",
-        description="""
-        # Audio Transcription API with Speaker Identification
-        
-        This API provides high-performance audio transcription with optional speaker identification
-        (diarization). It uses Whisper models with GPU acceleration for processing.
-        
-        ## Key Features:
-        - Transcribe audio files with timestamps
-        - Identify speakers in audio (optional diarization)
-        - Multiple model sizes for different needs
-        - Asynchronous processing for large files
-        - Real-time status updates
-        
-        ## Integration Guide
-        For frontend integration, use the following endpoint flow:
-        1. Submit audio with `POST /transcriptions`
-        2. Poll status with `GET /transcriptions/{job_id}/status`
-        3. Retrieve results with `GET /transcriptions/{job_id}`
-        
-        ## Performance Considerations
-        - GPU processing gives ~5-10x realtime performance
-        - Larger models are more accurate but slower
-        - Diarization adds processing time but enables speaker tracking
-        """,
-        routes=app.routes,
+    # Format the short request ID for display
+    short_id = request_id[:8]
+    
+    logger.info(
+        f"→ [api.request]Request started:[/api.request] "
+        f"[task.id]R_ID={short_id}...[/task.id] "
+        f"IP={request.state.client_ip} "
+        f"[api.method]{request.method}[/api.method] "
+        f"URL=[api.url]{request.url.path}[/api.url]"
     )
     
-    # Add custom components and schemas
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
+    try:
+        response = await call_next(request)
+        process_time = (time.time() - start_time) * 1000
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Process-Time-MS"] = f"{process_time:.2f}"
+        
+        status_style = "api.status.success" if response.status_code < 400 else "api.status.error"
+        logger.info(
+            f"✓ [api.response]Request finished:[/api.response] "
+            f"[task.id]R_ID={short_id}...[/task.id] "
+            f"Status=[{status_style}]{response.status_code}[/{status_style}] "
+            f"Duration=[api.duration]{process_time:.2f}ms[/api.duration]"
+        )
+        
+        return response
+    except Exception as e:
+        process_time = (time.time() - start_time) * 1000
+        logger.error(
+            f"❌ [danger]Request failed:[/danger] "
+            f"[task.id]R_ID={short_id}...[/task.id] "
+            f"Error=[danger]{type(e).__name__}[/danger] "
+            f"Duration=[api.duration]{process_time:.2f}ms[/api.duration]"
+        )
+        raise e
 
-@app.get("/docs", include_in_schema=False)
-async def custom_swagger_ui_html():
-    """Custom Swagger UI with additional metadata."""
-    return get_swagger_ui_html(
-        openapi_url="/openapi.json",
-        title="Whisper Transcription API",
-        swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@4/swagger-ui-bundle.js",
-        swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@4/swagger-ui.css",
+# Audit Logging Middleware
+@app.middleware("http")
+async def audit_logging_middleware(request: Request, call_next):
+    if not settings.AUDIT_LOGGING_ENABLED or not audit_logger:
+        return await call_next(request)
+    
+    start_time = time.time()
+    request_id = getattr(request.state, "request_id", "N/A")
+    client_ip = getattr(request.state, "client_ip", "unknown")
+    log_extra = {'request_id': request_id, 'client_ip': client_ip}
+    
+    audit_logger.info(f"REQ Start: {request.method} {request.url.path} QS='{request.url.query}'", extra=log_extra)
+    
+    try:
+        response = await call_next(request)
+        duration_ms = (time.time() - start_time) * 1000
+        audit_logger.info(f"RES End: Status={response.status_code} Duration={duration_ms:.2f}ms", extra=log_extra)
+        return response
+    except Exception as e:
+        duration_ms = (time.time() - start_time) * 1000
+        status_code = 500
+        if isinstance(e, HTTPException): 
+            status_code = e.status_code
+        audit_logger.error(f"REQ Error: Status={status_code} Type={type(e).__name__} Msg='{e}' Duration={duration_ms:.2f}ms", extra=log_extra)
+        raise e
+
+# --- Custom Exception Handlers ---
+@app.exception_handler(BaseApiException)
+async def handle_custom_api_exceptions(request: Request, exc: BaseApiException):
+    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+    
+    # Determine the error category and style
+    error_category = "SERVER ERROR"
+    error_style = "danger"
+    
+    if isinstance(exc, ModelNotFoundError): 
+        status_code = status.HTTP_404_NOT_FOUND
+        error_category = "NOT FOUND"
+        error_style = "warning"
+    elif isinstance(exc, ConfigurationError): 
+        status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        error_category = "SERVICE UNAVAILABLE"
+        error_style = "danger"
+    elif isinstance(exc, FileProcessingError): 
+        status_code = status.HTTP_400_BAD_REQUEST
+        error_category = "BAD REQUEST"
+        error_style = "warning"
+    # Transcription/DiarizationError remain 500
+    
+    request_id = getattr(request.state, "request_id", "N/A")
+    short_id = request_id[:8] if len(request_id) > 8 else request_id
+    log_level = logging.ERROR if status_code >= 500 else logging.WARNING
+    
+    # Create a styled panel for exception
+    error_message = Panel(
+        f"[{error_style}]{type(exc).__name__}[/{error_style}]: {exc.message}",
+        title=f"[{error_style}]{error_category}[/{error_style}]",
+        subtitle=f"Request ID: {short_id}...",
+        border_style=error_style
+    )
+    
+    logger.log(log_level, error_message, exc_info=status_code >= 500)
+    
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": exc.message, "request_id": request_id, "error_type": type(exc).__name__},
     )
 
-app.openapi = custom_openapi
-
-@app.get("/", tags=["Health"])
-async def root():
-    """Basic health check endpoint."""
-    return {"message": "Whisper Transcription API is running"}
-
-@app.get("/status", response_model=APIStatus, tags=["System"])
-async def get_status():
-    """
-    Get detailed system status including GPU and diarization availability.
+@app.exception_handler(HTTPException)
+async def http_exception_handler_override(request: Request, exc: HTTPException):
+    request_id = getattr(request.state, "request_id", "N/A")
     
-    Returns information about the API's capabilities, loaded models,
-    and hardware status for monitoring and diagnostics.
-    """
-    gpu_info = check_gpu()
-    
-    # Add diarization status
-    diarization_status = {
-        "enabled": settings.DIARIZATION_ENABLED,
-        "available": DIARIZATION_AVAILABLE,
-        "huggingface_token_set": bool(settings.HUGGINGFACE_TOKEN)
-    }
-    
-    return {
-        "status": "ok",
-        "version": "1.0.0",
-        "gpu": gpu_info,
-        "diarization": diarization_status,
-        "default_model": settings.DEFAULT_MODEL,
-        "models_in_memory": list(model_manager._model_cache.keys()) if hasattr(model_manager, "_model_cache") else [],
-    }
-
-@app.get("/gpu-status", tags=["System"])
-async def gpu_status():
-    """
-    Get detailed information about available GPUs.
-    
-    Returns comprehensive GPU information including memory usage,
-    capabilities, and current status.
-    """
-    return check_gpu()
-
-@app.post("/transcriptions", response_model=Dict[str, Any], tags=["Transcription"])
-async def create_transcription(
-    audio_file: UploadFile = File(..., description="Audio file to transcribe (MP3, WAV, etc.)"),
-    language: str = Query(settings.DEFAULT_LANGUAGE, description="Language code (e.g., 'sv' for Swedish)"),
-    model_size: ModelSize = Query(ModelSize(settings.DEFAULT_MODEL), description="Model size to use for transcription"),
-    diarization: bool = Query(False, description="Enable speaker diarization (requires Hugging Face token)"),
-    num_speakers: Optional[int] = Query(None, description="Fixed number of speakers (overrides min/max)"),
-    min_speakers: Optional[int] = Query(None, description="Minimum number of speakers"),
-    max_speakers: Optional[int] = Query(None, description="Maximum number of speakers")
-):
-    """
-    Start a new transcription job with optional speaker diarization.
-    
-    This endpoint accepts an audio file and starts an asynchronous transcription process.
-    It returns a job ID that can be used to check status and retrieve results.
-    
-    If diarization is enabled, speakers will be identified in the output segments.
-    """
-    # Check GPU availability
-    gpu_info = check_gpu()
-    if not gpu_info["available"]:
-        raise HTTPException(status_code=503, detail="GPU not available. This service requires CUDA.")
-    
-    # Check file size
-    max_file_size_mb = 1000  # 1GB file size limit
-    if audio_file.size > max_file_size_mb * 1024 * 1024:
-        raise HTTPException(
-            status_code=413, 
-            detail=f"File too large. Maximum allowed size is {max_file_size_mb}MB."
-        )
-    
-    # Check content type
-    valid_audio_types = [
-        'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/wave', 'audio/x-wav',
-        'audio/ogg', 'audio/flac', 'audio/x-flac'
-    ]
-    if audio_file.content_type not in valid_audio_types and not audio_file.filename.endswith(
-        ('.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac')
-    ):
-        logger.warning(f"Suspicious content type: {audio_file.content_type}, filename: {audio_file.filename}")
-        # Allow but warn - content type is sometimes incorrect in uploads
-    
-    # Check if diarization is enabled but not configured
-    if diarization and not settings.DIARIZATION_ENABLED:
-        raise HTTPException(
-            status_code=400, 
-            detail="Diarization is not enabled in server configuration. Set DIARIZATION_ENABLED=True in .env"
-        )
-        
-    # Check if diarization is requested but dependencies not available
-    if diarization and settings.DIARIZATION_ENABLED and not DIARIZATION_AVAILABLE:
-        logger.warning("Diarization requested but dependencies not available")
-        # We'll still process the request, but without diarization
-        diarization = False
-    
-    # Generate unique ID for this transcription
-    job_id = str(uuid.uuid4())
-    
-    # Save uploaded file to a temporary location
-    temp_dir = tempfile.mkdtemp()
-    file_path = os.path.join(temp_dir, f"{job_id}_{audio_file.filename}")
-    
-    try:
-        # Log job creation
-        logger.info(f"Creating job {job_id} for file {audio_file.filename}")
-        
-        # Save the uploaded file
-        with open(file_path, "wb") as f:
-            shutil.copyfileobj(audio_file.file, f)
-        
-        # Initialize job in our storage
-        transcription_jobs[job_id] = {
-            "id": job_id,
-            "status": ProcessingStatus.PENDING,
-            "progress": 0.0,
-            "file_path": file_path,
-            "language": language,
-            "model_size": model_size.value,
-            "diarization": diarization,
-            "num_speakers": num_speakers,
-            "min_speakers": min_speakers,
-            "max_speakers": max_speakers,
-            "start_time": time.time()
-        }
-        
-        # Start processing in background
-        asyncio.create_task(process_audio_job(job_id))
-        
-        # Return job ID to client with initial status
-        return {
-            "id": job_id, 
-            "status": ProcessingStatus.PENDING,
-            "progress": 0.0
-        }
-    
-    except Exception as e:
-        # Clean up on error
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-        logger.exception(f"Error creating transcription job: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/transcriptions/{job_id}/status", response_model=Dict[str, Any], tags=["Transcription"])
-async def get_transcription_status(job_id: str):
-    """
-    Check the status of a transcription job.
-    
-    Returns the current status and progress of the transcription job.
-    This endpoint can be polled regularly to track job progress.
-    """
-    if job_id not in transcription_jobs:
-        raise HTTPException(status_code=404, detail=f"Transcription job {job_id} not found")
-    
-    # Get a copy of the current job status to avoid blocking
-    job = transcription_jobs[job_id].copy()
-    
-    return {
-        "id": job_id, 
-        "status": job["status"],
-        "progress": job.get("progress", 0.0),
-        "error": job.get("error") if job["status"] == ProcessingStatus.ERROR else None
-    }
-
-@app.get("/transcriptions/{job_id}", response_model=TranscriptionResult, tags=["Transcription"])
-async def get_transcription_result(
-    job_id: str,
-    include_segments: bool = Query(True, description="Include timestamped segments in the response")
-):
-    """
-    Get the result of a completed transcription job.
-    
-    Returns the full transcription result including text, segments, and
-    speaker information if diarization was enabled. This endpoint should be
-    called after the job status is 'completed'.
-    
-    For bandwidth efficiency with large transcriptions, you can set
-    include_segments=false to get only the full transcription text.
-    """
-    if job_id not in transcription_jobs:
-        raise HTTPException(status_code=404, detail=f"Transcription job {job_id} not found")
-    
-    job = transcription_jobs[job_id]
-    
-    # Include segments based on parameter
-    segments = job.get("segments", []) if include_segments else []
-    
-    return {
-        "id": job_id,
-        "status": job["status"],
-        "progress": job.get("progress", 1.0) if job["status"] == ProcessingStatus.COMPLETED else job.get("progress", 0.0),
-        "transcription": job.get("transcription"),
-        "segments": segments,
-        "speakers": job.get("speakers", []),
-        "duration": job.get("duration"),
-        "processing_time": job.get("processing_time"),
-        "error": job.get("error") if job["status"] == ProcessingStatus.ERROR else None
-    }
-
-@app.delete("/transcriptions/{job_id}", status_code=204, tags=["Transcription"])
-async def delete_transcription(job_id: str):
-    """
-    Delete a transcription job and its resources.
-    
-    This endpoint allows clients to clean up a job after they're done with it,
-    freeing up server resources. It works regardless of job status.
-    """
-    if job_id not in transcription_jobs:
-        raise HTTPException(status_code=404, detail=f"Transcription job {job_id} not found")
-    
-    job = transcription_jobs[job_id]
-    
-    # Clean up any files if they still exist
-    file_path = job.get("file_path")
-    if file_path and os.path.exists(file_path):
-        try:
-            os.remove(file_path)
-            dir_path = os.path.dirname(file_path)
-            if os.path.exists(dir_path) and not os.listdir(dir_path):
-                os.rmdir(dir_path)
-        except Exception as e:
-            logger.warning(f"Error cleaning up files for job {job_id}: {e}")
-    
-    # Remove the job from storage
-    del transcription_jobs[job_id]
-    return None  # 204 No Content
-
-async def process_audio_job(job_id: str):
-    """
-    Process a transcription/diarization job in the background with progress tracking.
-    """
-    job = transcription_jobs[job_id]
-    file_path = job["file_path"]
-    
-    # Update status function
-    def update_job_status(status, progress):
-        if job_id in transcription_jobs:
-            job["status"] = status
-            job["progress"] = progress
-    
-    try:
-        logger.info(f"Processing job {job_id}")
-        update_job_status(ProcessingStatus.PENDING, 0.0)
-        
-        # Make sure the file exists
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Input file {file_path} not found")
-        
-        # Process audio with transcription and optional diarization
-        result = await process_audio(
-            file_path=file_path,
-            language=job["language"],
-            model_size=job["model_size"],
-            enable_diarization=job.get("diarization", False),
-            num_speakers=job.get("num_speakers"),
-            min_speakers=job.get("min_speakers"),
-            max_speakers=job.get("max_speakers"),
-            progress_callback=update_job_status
-        )
-        
-        # Update job with results
-        update_job_status(ProcessingStatus.COMPLETED, 1.0)
-        job.update({
-            "transcription": result["transcription"],
-            "segments": result["segments"],
-            "speakers": result.get("speakers", []),
-            "duration": result["duration"],
-            "processing_time": result["processing_time"]
-        })
-        
-        logger.info(f"Job {job_id} completed successfully")
-        
-    except (TranscriptionError, DiarizationError) as e:
-        # Handle specific errors
-        logger.error(f"Job {job_id} failed with {type(e).__name__}: {e}")
-        update_job_status(ProcessingStatus.ERROR, 0.0)
-        job["error"] = str(e)
-    
-    except Exception as e:
-        # Handle unexpected errors
-        logger.exception(f"Job {job_id} failed with unexpected error: {e}")
-        update_job_status(ProcessingStatus.ERROR, 0.0)
-        job["error"] = f"Unexpected error: {str(e)}"
-    
-    finally:
-        # Clean up temporary file ONLY after processing is complete
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                # Only try to remove directory if it exists
-                dir_path = os.path.dirname(file_path)
-                if os.path.exists(dir_path) and not os.listdir(dir_path):
-                    os.rmdir(dir_path)
-                logger.debug(f"Cleaned up temporary files for job {job_id}")
-        except Exception as e:
-            logger.error(f"Error cleaning up files for job {job_id}: {e}")
-
-# Cleanup old jobs periodically (runs every hour)
-@app.on_event("startup")
-async def setup_periodic_tasks():
-    # Start the cleanup task
-    asyncio.create_task(periodic_cleanup())
-    
-    # Pre-load the default model if configured
-    if settings.PRELOAD_DEFAULT_MODEL:
-        asyncio.create_task(preload_default_model())
-
-async def preload_default_model():
-    """Pre-load the default model at startup."""
-    try:
-        logger.info(f"Pre-loading default model: {settings.DEFAULT_MODEL}")
-        # This will trigger model loading through the manager
-        _ = model_manager.get_pipeline(settings.DEFAULT_MODEL)
-        logger.info(f"Default model pre-loaded successfully")
-    except Exception as e:
-        logger.error(f"Failed to pre-load default model: {e}")
-
-async def periodic_cleanup():
-    """Run periodic cleanup tasks."""
-    while True:
-        await asyncio.sleep(3600)  # Wait for 1 hour
-        try:
-            cleanup_old_jobs()
-            # Also run memory cleanup
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception as e:
-            logger.error(f"Error in periodic cleanup: {e}")
-
-def cleanup_old_jobs(max_age_hours=settings.JOB_CLEANUP_HOURS):
-    """Clean up transcription jobs older than the specified age."""
-    current_time = time.time()
-    jobs_to_remove = []
-    
-    for job_id, job in transcription_jobs.items():
-        # If job is older than max_age_hours, mark for removal
-        if current_time - job["start_time"] > max_age_hours * 3600:
-            # Make sure the job is not still processing
-            if job["status"] not in [ProcessingStatus.PENDING, ProcessingStatus.TRANSCRIBING, ProcessingStatus.DIARIZING]:
-                jobs_to_remove.append(job_id)
-    
-    # Remove marked jobs
-    for job_id in jobs_to_remove:
-        # Clean up any remaining files
-        job = transcription_jobs[job_id]
-        file_path = job.get("file_path")
-        if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-                dir_path = os.path.dirname(file_path)
-                if os.path.exists(dir_path) and not os.listdir(dir_path):
-                    os.rmdir(dir_path)
-            except Exception:
-                pass
-                
-        # Remove from cache
-        del transcription_jobs[job_id]
-    
-    if jobs_to_remove:
-        logger.info(f"Cleaned up {len(jobs_to_remove)} old transcription jobs")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "app.main:app", 
-        host="0.0.0.0", 
-        port=8000,
-        reload=settings.DEBUG,
-        workers=1  # Multiple workers can cause issues with GPU memory
+    logger.warning(
+        f":warning: [warning]HTTPException[/warning] [task.id][{request_id}][/task.id]: "
+        f"Status=[api.status.error]{exc.status_code}[/api.status.error], "
+        f"Detail={exc.detail}"
     )
+    
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "request_id": request_id, "error_type": "HTTPException"},
+        headers=exc.headers,
+    )
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    request_id = getattr(request.state, "request_id", "N/A")
+    
+    logger.error(
+        f":rotating_light: [danger]Unhandled exception[/danger] [task.id][{request_id}][/task.id]: "
+        f"[danger]{type(exc).__name__}[/danger]: {exc}", 
+        exc_info=True
+    )
+    
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "An unexpected internal server error occurred.", "request_id": request_id, "error_type": type(exc).__name__},
+    )
+
+# --- API Routers ---
+from app.api.router_registry import (
+    router_health, router_system, router_transcription, router_diarization
+)
+# Import route modules AFTER app/handlers defined
+from app.api.routes import health, system, transcription, diarization
+# Define dependencies
+api_dependencies = [Depends(get_api_key)] if settings.API_AUTH_REQUIRED else []
+# Include routers
+app.include_router(router_health, prefix="/health")
+app.include_router(router_system, dependencies=api_dependencies)
+app.include_router(router_transcription, dependencies=api_dependencies)
+app.include_router(router_diarization, dependencies=api_dependencies)
+
+# --- Root Endpoint ---
+@app.get("/", include_in_schema=False)
+async def read_root():
+    """Redirects root path to API documentation."""
+    return RedirectResponse(url="/docs")

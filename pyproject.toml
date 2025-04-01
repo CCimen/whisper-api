@@ -1,0 +1,92 @@
+[project]
+name = "whisper-transcription-api"
+version = "1.1.0" # Incremented version
+description = "High-performance API for audio transcription with speaker diarization, focusing on privacy and GPU support."
+authors = [{ name = "Your Name", email = "your.email@example.com" }] # Update with your details
+requires-python = ">=3.10"
+license = { text = "MIT" }
+readme = "README.md"
+
+dependencies = [
+    "fastapi>=0.110.0,<0.112.0", # Pin fastapi minor version for stability
+    "uvicorn[standard]>=0.27.0,<0.35.0", # Pin uvicorn minor version
+    "pydantic>=2.5.0,<3.0.0", # Use Pydantic v2
+    "pydantic-settings>=2.0.0,<3.0.0",
+    "python-multipart>=0.0.7,<0.0.10", # Updated version range
+    "python-dotenv>=1.0.0,<1.1.0",
+    "accelerate>=0.29.0,<0.32.0", # Pin accelerate minor version
+    "torch>=2.1.0", # Specify base torch dependency (>=2.1 recommended for some optimizations)
+    "torchaudio>=2.1.0",
+    "transformers>=4.38.0,<4.43.0", # Pin transformers minor version
+    "numpy>=1.24.3,<2.0.0", # Critical for pyannote compatibility
+    "librosa>=0.10.0,<0.12.0",
+    "ffmpeg-python>=0.2.0,<0.3.0",
+    "requests>=2.30.0,<2.33.0",
+    "tenacity>=8.2.0,<8.5.0", # Updated version range
+    "pandas>=2.0.0,<2.3.0", # Added for processor.py/diarization.py, Pydantic v2 friendly
+    "psutil>=5.9.5,<5.10.0", # For system monitoring
+    "GPUtil>=1.4.0,<1.5.0", # For GPU monitoring (optional but useful)
+    "rich>=13.0.0,<14.0.0", # For enhanced logging output
+    # tabulate removed as it wasn't used
+]
+
+[project.optional-dependencies]
+diarization = [
+    "pyannote.audio==3.1", # Pinning specific version known to work with numpy<2.0
+    "pydub>=0.25.0,<0.26.0",
+]
+# Example for different PyTorch CUDA versions (users install these manually or adjust Dockerfile)
+# gpu_cu118 = ["torch==2.1.2+cu118", "torchaudio==2.1.2+cu118"]
+# gpu_cu121 = ["torch==2.1.2+cu121", "torchaudio==2.1.2+cu121"]
+
+dev = [
+    "pytest>=7.0.0,<8.3.0",
+    "httpx>=0.25.0,<0.28.0", # For testing async API clients
+    "ruff>=0.1.0", # Highly recommended linter/formatter
+    "mypy>=1.0.0", # Optional static type checker
+]
+
+[tool.uv]
+# Configuration for uv can be added here if needed, e.g., index URLs
+# Example:
+# index-url = "https://pypi.org/simple"
+# extra-index-url = ["https://download.pytorch.org/whl/cu118"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+# Example Ruff config (optional, adjust as needed)
+line-length = 88
+select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM", "PTH", "RUF"] # Common rules + ruff specific
+ignore = ["B008"] # Ignore function calls as default values if intended
+
+[tool.ruff.lint]
+# Explicitly select rule sets
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "C4", # flake8-comprehensions
+    "B",  # flake8-bugbear
+    "UP", # pyupgrade
+    "PTH",# flake8-use-pathlib
+    "SIM",# flake8-simplify
+    "RUF",# Ruff-specific rules
+]
+ignore = ["B008", "E501"] # Ignore function calls in argument defaults, Line too long (handled by formatter)
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+# Configuration for Mypy (optional)
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true # Be stricter in mature projects

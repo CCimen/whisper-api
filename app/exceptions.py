@@ -1,19 +1,29 @@
 """
-Custom exceptions for the Whisper Transcription API.
+Custom exception classes for the Whisper Transcription API.
 """
 
-class ModelNotFoundError(Exception):
-    """Raised when a model is not found."""
+class BaseApiException(Exception):
+    """Base class for custom API exceptions."""
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(self.message)
+
+class ModelNotFoundError(BaseApiException):
+    """Raised when a requested model is not found or configured."""
     pass
 
-class TranscriptionError(Exception):
-    """Raised when transcription fails."""
+class TranscriptionError(BaseApiException):
+    """Raised when an error occurs during the transcription process."""
     pass
 
-class DiarizationError(Exception):
-    """Raised when diarization fails."""
+class DiarizationError(BaseApiException):
+    """Raised when an error occurs during the speaker diarization process."""
     pass
 
-class ConfigurationError(Exception):
-    """Raised when there is a configuration error."""
+class ConfigurationError(BaseApiException):
+    """Raised when there is a configuration problem preventing operation."""
+    pass
+
+class FileProcessingError(BaseApiException):
+    """Raised when there is an error processing an uploaded file."""
     pass

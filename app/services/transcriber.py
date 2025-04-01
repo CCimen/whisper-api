@@ -15,6 +15,7 @@ import librosa
 import numpy as np
 import concurrent.futures
 import subprocess
+import weakref
 from typing import Dict, Any, Optional, Callable, Tuple, List
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
@@ -36,12 +37,13 @@ class ModelManager:
     # Class-level lock for thread safety
     _model_lock = threading.RLock()
     
-    # Model cache
-    _model_cache = {}  # model_name -> (model, processor, pipeline)
+    # Model cache - using weakrefs for processor and pipeline to help garbage collection
+    _model_cache = {}  # model_name -> (model, processor_ref, pipeline_ref)
     _current_model = None
     _model_load_timestamps = {}
     _model_usage_count = {}
     _initialized = False
+    _memory_critical = False
     
     def __init__(self):
         """Initialize the model manager with optimal settings."""
@@ -90,7 +92,64 @@ class ModelManager:
             # Report memory status
             if hasattr(torch.cuda, 'mem_get_info'):
                 free_mem, total_mem = torch.cuda.mem_get_info(0)
-                logger.info(f"GPU memory after cleanup: {free_mem / (1024**3):.2f}GB free of {total_mem / (1024**3):.2f}GB total")
+                free_gb = free_mem / (1024**3)
+                used_gb = (total_mem - free_mem) / (1024**3)
+                logger.info(f"GPU memory after cleanup: {free_gb:.2f}GB free, {used_gb:.2f}GB used of {total_mem / (1024**3):.2f}GB total")
+                
+                # Set memory critical flag if memory is running low
+                ModelManager._memory_critical = free_gb < 2.0
+    
+    def check_memory_status(self):
+        """Check GPU memory and return a status report."""
+        if torch.cuda.is_available() and hasattr(torch.cuda, 'mem_get_info'):
+            free_mem, total_mem = torch.cuda.mem_get_info(0)
+            free_gb = free_mem / (1024**3)
+            used_gb = (total_mem - free_mem) / (1024**3)
+            
+            # Critical memory threshold
+            if free_gb < 1.0:
+                logger.critical(f"CRITICALLY LOW GPU MEMORY: {free_gb:.2f}GB free, forcing cleanup")
+                ModelManager._memory_critical = True
+                self.emergency_cleanup()
+            elif free_gb < 2.0:
+                logger.warning(f"LOW GPU MEMORY: {free_gb:.2f}GB free, {used_gb:.2f}GB used")
+                ModelManager._memory_critical = True
+            else:
+                ModelManager._memory_critical = False
+                
+            return {
+                "free_gb": free_gb,
+                "used_gb": used_gb,
+                "total_gb": total_mem / (1024**3),
+                "critical": ModelManager._memory_critical
+            }
+        
+        return {"error": "CUDA memory info not available"}
+    
+    def emergency_cleanup(self):
+        """Aggressive memory cleanup in emergency situations."""
+        logger.warning("Performing emergency GPU memory cleanup")
+        
+        # Get list of models to unload
+        models_to_unload = list(ModelManager._model_cache.keys())
+        
+        # Keep only default model if possible
+        if settings.DEFAULT_MODEL in models_to_unload and len(models_to_unload) > 1:
+            models_to_unload = [m for m in models_to_unload if m != settings.DEFAULT_MODEL]
+        
+        # Unload all models except potentially the default
+        for model_name in models_to_unload:
+            self._unload_model(model_name, force=True)
+        
+        # Extra aggressive memory cleanup
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            # Double empty_cache can help with fragmentation
+            torch.cuda.empty_cache()
+        
+        # Check memory again
+        self.check_memory_status()
     
     def _should_keep_model_in_memory(self, new_model_name):
         """
@@ -102,6 +161,11 @@ class ModelManager:
         - Model usage patterns
         - Model sizes and relationships
         """
+        # If memory is critical, don't keep multiple models
+        if ModelManager._memory_critical:
+            logger.warning("Memory is critical, not keeping multiple models")
+            return False
+            
         # If multiple models is disabled, always unload previous model
         if not settings.KEEP_MULTIPLE_MODELS_IN_MEMORY:
             return False
@@ -116,7 +180,7 @@ class ModelManager:
             new_size = MODEL_CACHE_CONFIG[new_model_name]["max_memory_gb"]
             
             # If new model is much larger, unload current
-            if new_size > current_size * 2:
+            if new_size > current_size * 1.5:
                 logger.info(f"New model {new_model_name} is significantly larger than current model, unloading current")
                 return False
         
@@ -147,38 +211,62 @@ class ModelManager:
         # If CUDA is not available, don't keep multiple models in memory
         return False
     
-    def _unload_model(self, model_name):
+    def _unload_model(self, model_name, force=False):
         """Unload a model with optimal memory cleanup."""
         logger.info(f"Unloading model '{model_name}' to free memory")
         
         if model_name not in ModelManager._model_cache:
             logger.warning(f"Model {model_name} not found in cache for unloading")
-            return
+            return False
+        
+        # Don't unload current model unless forced
+        if not force and model_name == ModelManager._current_model:
+            logger.info(f"Not unloading current model {model_name}")
+            return False
         
         try:
-            # Get model components
-            model, processor, pipeline_obj = ModelManager._model_cache[model_name]
+            # Get model components - note these might be weakrefs
+            model, processor_ref, pipeline_ref = ModelManager._model_cache[model_name]
+            
+            # Resolve weakrefs if needed
+            processor = processor_ref() if isinstance(processor_ref, weakref.ReferenceType) else processor_ref
+            pipeline_obj = pipeline_ref() if isinstance(pipeline_ref, weakref.ReferenceType) else pipeline_ref
             
             # Move model to CPU before deleting - helps prevent CUDA OOM errors
-            if torch.cuda.is_available():
+            if torch.cuda.is_available() and model is not None:
                 try:
-                    pipeline_obj.model.to(torch.device("cpu"))
+                    model.to(torch.device("cpu"))
                     logger.info(f"Model {model_name} moved to CPU before unloading")
                 except Exception as e:
                     logger.warning(f"Error moving model to CPU: {e}")
             
-            # Delete from cache and clear references
+            # Clear the pipeline references
+            if pipeline_obj is not None:
+                # Clear model reference in pipeline
+                for attr in ['model', 'tokenizer', 'feature_extractor', 'processor']:
+                    if hasattr(pipeline_obj, attr):
+                        try:
+                            setattr(pipeline_obj, attr, None)
+                        except:
+                            pass
+            
+            # Delete from cache
             del ModelManager._model_cache[model_name]
             
-            # More aggressive memory cleanup
-            for attr in ['model', 'tokenizer', 'feature_extractor', 'processor']:
-                if hasattr(pipeline_obj, attr):
-                    setattr(pipeline_obj, attr, None)
+            # Set current model to None if we're unloading it
+            if ModelManager._current_model == model_name:
+                ModelManager._current_model = None
             
-            # Explicitly delete pipeline to help garbage collection
-            pipeline_obj = None
+            # Clean up model usage tracking
+            if model_name in ModelManager._model_usage_count:
+                del ModelManager._model_usage_count[model_name]
+            if model_name in ModelManager._model_load_timestamps:
+                del ModelManager._model_load_timestamps[model_name]
+            
+            # Explicitly delete references to help garbage collection
             model = None
             processor = None
+            pipeline_obj = None
             
             # Force Python garbage collection
             gc.collect()
@@ -186,8 +274,8 @@ class ModelManager:
             # Empty CUDA cache
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                if hasattr(torch.cuda, 'mem_reset_peak_memory_stats'):
-                    torch.cuda.reset_peak_memory_stats()
+                # Second empty_cache can help with fragmented memory
+                torch.cuda.empty_cache()
             
             logger.info(f"✓ Model '{model_name}' unloaded and memory freed")
             return True
@@ -203,11 +291,11 @@ class ModelManager:
         - Model size
         """
         if not ModelManager._model_cache:
-            return
+            return False
         
         # Skip if we only have the current model loaded
         if len(ModelManager._model_cache) == 1 and ModelManager._current_model in ModelManager._model_cache:
-            return
+            return False
         
         # Calculate a score for each model that balances usage and recency
         current_time = time.time()
@@ -243,6 +331,9 @@ class ModelManager:
         If the model is not in cache, load it with optimal settings.
         """
         with ModelManager._model_lock:
+            # Check memory status and cleanup if needed
+            self.check_memory_status()
+            
             # Validate model size
             if model_size not in WHISPER_MODELS:
                 available_models = list(WHISPER_MODELS.keys())
@@ -252,7 +343,18 @@ class ModelManager:
             # Check if model is in cache
             if model_size in ModelManager._model_cache:
                 logger.info(f"Using cached model: {model_size}")
-                model, processor, pipeline_obj = ModelManager._model_cache[model_size]
+                
+                # Get model components - resolve weakrefs
+                _, processor_ref, pipeline_ref = ModelManager._model_cache[model_size]
+                processor = processor_ref() if isinstance(processor_ref, weakref.ReferenceType) else processor_ref
+                pipeline_obj = pipeline_ref() if isinstance(pipeline_ref, weakref.ReferenceType) else pipeline_ref
+                
+                # Check if the weakrefs are still valid
+                if pipeline_obj is None:
+                    logger.warning(f"Cached pipeline for {model_size} was garbage collected, reloading")
+                    # Remove from cache and reload
+                    del ModelManager._model_cache[model_size]
+                    return self.get_pipeline(model_size)
                 
                 # Update usage statistics
                 ModelManager._current_model = model_size
@@ -279,6 +381,8 @@ class ModelManager:
             if torch.cuda.is_available() and hasattr(torch.cuda, 'mem_get_info'):
                 free_mem, total_mem = torch.cuda.mem_get_info(0)
                 free_gb = free_mem / (1024**3)
+                
+                # If memory is getting tight, unload a model
                 if free_gb < settings.MIN_FREE_MEMORY_GB:
                     self._unload_least_used_model()
             
@@ -286,7 +390,7 @@ class ModelManager:
             try:
                 start_time = time.time()
                 
-                # Get the device and dtype
+                # Get the device and dtype - always use CUDA if available
                 device = "cuda:0" if torch.cuda.is_available() else "cpu"
                 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
                 
@@ -311,7 +415,7 @@ class ModelManager:
                     model = model.to(device)
                     
                     # Apply compile if available (PyTorch 2.0+)
-                    if hasattr(torch, 'compile'):
+                    if hasattr(torch, 'compile') and model_size != "large":  # Skip for large model to avoid OOM
                         try:
                             model = torch.compile(model)
                             logger.info("Applied torch.compile() optimization")
@@ -324,25 +428,37 @@ class ModelManager:
                     cache_dir=settings.MODELS_CACHE_DIR
                 )
                 
-                # Get optimal batch size based on model size
-                if model_size == "tiny": 
-                    batch_size = 16
-                elif model_size == "small":
-                    batch_size = 12
-                elif model_size == "medium":
-                    batch_size = 8
-                else:
-                    batch_size = 4  # Conservative for large
+                # Tune batch and chunk size based on model size and available memory
+                mem_status = self.check_memory_status()
+                free_gb = mem_status.get("free_gb", 4.0) if isinstance(mem_status, dict) else 4.0
                 
-                # Tune chunk size based on model
-                if model_size == "tiny":
-                    chunk_size = 30
+                # Optimize batch size based on available memory and model size
+                if model_size == "tiny": 
+                    batch_size = min(int(free_gb * 4), 16)  # Scale with available memory
                 elif model_size == "small":
-                    chunk_size = 30
+                    batch_size = min(int(free_gb * 3), 12)
                 elif model_size == "medium":
-                    chunk_size = 25
-                else:
-                    chunk_size = 20
+                    batch_size = min(int(free_gb * 2), 8)
+                else:  # large
+                    batch_size = min(int(free_gb), 4)
+                
+                # Ensure batch size is at least 1
+                batch_size = max(1, batch_size)
+                
+                # Tune chunk size based on model and memory
+                if model_size == "tiny":
+                    chunk_size = min(int(free_gb * 8), 30)
+                elif model_size == "small":
+                    chunk_size = min(int(free_gb * 6), 30)
+                elif model_size == "medium":
+                    chunk_size = min(int(free_gb * 5), 25)
+                else:  # large
+                    chunk_size = min(int(free_gb * 4), 20)
+                
+                # Ensure chunk size is at least 10 seconds
+                chunk_size = max(10, chunk_size)
+                
+                logger.info(f"Optimized settings for {model_size}: batch_size={batch_size}, chunk_size={chunk_size}")
                 
                 # Create pipeline with optimized settings
                 pipeline_obj = pipeline(
@@ -354,23 +470,43 @@ class ModelManager:
                     device=device,
                 )
                 
-                # Cache the model, processor, and pipeline
-                ModelManager._model_cache[model_size] = (model, processor, pipeline_obj)
-                ModelManager._current_model = model_size
-                ModelManager._model_load_timestamps[model_size] = time.time()
-                ModelManager._model_usage_count[model_size] = 1
-                
                 # Store optimal settings for this model in the pipeline object
                 pipeline_obj.optimal_batch_size = batch_size
                 pipeline_obj.optimal_chunk_size = chunk_size
                 
+                # Cache the model, processor, and pipeline with weakrefs to help gc
+                ModelManager._model_cache[model_size] = (
+                    model, 
+                    weakref.ref(processor), 
+                    weakref.ref(pipeline_obj)
+                )
+                
+                ModelManager._current_model = model_size
+                ModelManager._model_load_timestamps[model_size] = time.time()
+                ModelManager._model_usage_count[model_size] = 1
+                
                 load_time = time.time() - start_time
                 logger.info(f"✓ Model '{model_size}' loaded in {load_time:.2f}s")
+                
+                # Check memory after loading
+                self.check_memory_status()
                 
                 return pipeline_obj
             
             except Exception as e:
                 logger.exception(f"Error loading model '{model_size}': {e}")
+                
+                # Clean up memory and retry with a smaller model if possible
+                self._cleanup_gpu_memory()
+                
+                # If this was the medium or large model, try falling back to a smaller one
+                if model_size == "large" and "medium" in WHISPER_MODELS:
+                    logger.warning("Failed to load large model, falling back to medium")
+                    return self.get_pipeline("medium")
+                elif model_size == "medium" and "small" in WHISPER_MODELS:
+                    logger.warning("Failed to load medium model, falling back to small")
+                    return self.get_pipeline("small")
+                
                 raise TranscriptionError(f"Failed to load model: {e}")
 
 
@@ -506,6 +642,9 @@ async def transcribe_audio(
             logger.warning(f"Could not estimate audio duration: {e}")
             audio_duration = None
         
+        # Check memory before getting pipeline
+        model_manager.check_memory_status()
+        
         # Get the pipeline from model manager (uses caching)
         pipe = model_manager.get_pipeline(model_size)
         
@@ -532,7 +671,7 @@ async def transcribe_audio(
         
         # Run transcription with torch.inference_mode() for better memory usage
         with torch.inference_mode():
-            # Pin memory for better CPU->GPU transfer performance
+            # Clean cache before processing
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 
@@ -543,7 +682,6 @@ async def transcribe_audio(
                 batch_size=batch_size,
                 return_timestamps=True,
                 generate_kwargs=generate_kwargs
-                # Removed chunk_callback parameter as it's not supported
             )
             
             # Update progress after processing
@@ -586,6 +724,10 @@ async def transcribe_audio(
         logger.info(f"Realtime factor: {audio_duration/processing_time:.2f}x")
         logger.info(f"Output text length: {len(full_text)} characters")
         
+        # Clean up memory after processing
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         # Final progress update
         if progress_callback:
             progress_callback(1.0)
@@ -599,4 +741,9 @@ async def transcribe_audio(
         
     except Exception as e:
         logger.exception(f"Transcription failed: {e}")
+        
+        # Clean up memory on error
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         raise TranscriptionError(f"Transcription failed: {e}")

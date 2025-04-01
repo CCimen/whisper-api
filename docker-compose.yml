@@ -1,0 +1,90 @@
+# Remove the top-level 'version' attribute as it's deprecated
+services:
+  whisper-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whisper-api-prod
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      # Mount a volume to the user's HF cache for persistence (optional)
+      # If removed, cache is ephemeral within the container's filesystem layer
+      - whisper_hf_cache:/home/appuser/.cache/huggingface
+      # Keep volumes for uploads/results if needed for persistence or tmpfs
+      - whisper_uploads:/app/uploads
+      - whisper_results:/app/results
+      - whisper_logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Ensure app uses paths consistent with container layout
+      - UPLOAD_DIR=/app/uploads
+      - RESULTS_DIR=/app/results
+      - MODELS_CACHE_DIR=/home/appuser/.cache/huggingface/hub # Explicitly match HF standard
+      - AUDIT_LOG_PATH=/app/logs/audit.log
+      # Pass the token as the standard HF Hub environment variable
+      - HUGGING_FACE_HUB_TOKEN=${HUGGINGFACE_TOKEN}
+      # HF_HOME is set in Dockerfile, no need to repeat unless overriding
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s # Increased start period to allow model download/load
+
+  whisper-api-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: whisper-api-dev
+    env_file:
+      - .env
+    ports:
+      - "${DEV_PORT:-8080}:8080"
+    volumes:
+      - ./app:/app/app
+      - ./pyproject.toml:/app/pyproject.toml
+      # Persist HF cache during development
+      - whisper_hf_cache:/home/appuser/.cache/huggingface
+      - whisper_uploads:/app/uploads
+      - whisper_results:/app/results
+      - whisper_logs:/app/logs
+    environment:
+      - PORT=8080
+      - LOG_LEVEL=${DEV_LOG_LEVEL:-debug}
+      - RELOAD=true
+      - WORKERS=1
+      - API_AUTH_REQUIRED=false
+      - UPLOAD_DIR=/app/uploads
+      - RESULTS_DIR=/app/results
+      - MODELS_CACHE_DIR=/home/appuser/.cache/huggingface/hub
+      - AUDIT_LOG_PATH=/app/logs/audit.log
+      # HF_HOME set in Dockerfile
+    restart: unless-stopped
+    develop:
+      watch:
+        - action: sync
+          path: ./app
+          target: /app/app
+          ignore:
+            - .venv/
+            - __pycache__/
+        - action: rebuild
+          path: pyproject.toml
+
+volumes:
+  # Renamed volume for clarity
+  whisper_hf_cache:
+  whisper_uploads:
+  whisper_results:
+  whisper_logs:

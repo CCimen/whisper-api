@@ -1,303 +1,220 @@
-# Whisper Transcription API
+# 🎙️ Whisper Transcription API
 
-A high-performance API for audio transcription with speaker identification, built with FastAPI and optimized for GPU acceleration.
+[![Python](https://img.shields.io/badge/Python-3.10+-blue)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-green)](https://fastapi.tiangolo.com/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-CUDA-red)](https://pytorch.org/)
+[![uv](https://img.shields.io/badge/uv-Managed-green)](https://github.com/astral-sh/uv)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Docker](https://img.shields.io/badge/Docker-Supported-blue)](https://www.docker.com/)
 
-<div align="center">
+A high-performance API for audio transcription with optional speaker diarization, built with FastAPI and optimized for GPU acceleration and privacy. Designed for ease of use, maintainability, and integration, particularly for privacy-conscious users.
 
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.95%2B-green)](https://fastapi.tiangolo.com/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red)](https://pytorch.org/)
-[![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
+## ✨ Features
 
-</div>
+- **🚀 High-Performance Transcription**: Leverages GPU-accelerated Whisper models via `transformers`.
+- **🇸🇪 Optimized for Swedish**: Easily configure KB-Whisper models (thanks to [KBLab](https://huggingface.co/KBLab)) via `.env` for superior Swedish transcription accuracy.
+- **🔊 Speaker Identification**: Optional speaker diarization using `pyannote.audio` to identify _who_ spoke _when_.
+- **🔒 Privacy Focused**:
+  - **Automatic File Deletion**: Audio files automatically and securely deleted after processing (configurable).
+  - **Secure Storage**: Options for memory-based storage (`tmpfs`) or persistent volumes with secure directory permissions.
+  - **Anonymized Task IDs**: Uses UUIDs for task tracking.
+  - **Optional Audit Logging**: Track request metadata without logging sensitive data.
+- **⚙️ Asynchronous & Scalable**: Built with FastAPI and `asyncio`, uses a task queue (`TaskManager`) to handle concurrent requests efficiently based on configured limits (e.g., GPU VRAM).
+- **🐳 Dockerized**: Optimized multi-stage Dockerfile for production using `uv`. Includes options for GPU (NVIDIA) and CPU builds. `docker-compose.yml` provided.
+- **🔧 Configurable**: Settings managed via `.env` file and environment variables using `pydantic-settings`. Smart defaults based on detected system capabilities (e.g., GPU memory).
+- **📊 API Monitoring**: Endpoints for system status, GPU details, model status, and task queue monitoring.
+- **🎨 Enhanced Logging**: Uses `rich` for colorful, readable console logs, even in Docker.
 
-## Features
+## 🙏 Special Thanks
 
-- **🎯 High-Performance Transcription**: Uses GPU-accelerated Whisper models for ~5-10x realtime processing
-- **🔊 Speaker Identification**: Optional diarization to identify who said what (requires Hugging Face token)
-- **📊 Real-time Progress**: Track processing status with detailed progress updates
-- **🔄 Asynchronous Processing**: Handle large files without timeouts
-- **🎛️ Flexible Model Selection**: Choose from tiny, small, medium, or large models
-- **🚀 Production-Ready**: Optimized memory management, error handling, and resource monitoring
-- **📱 REST API**: Simple integration with any frontend or service
-- **📄 OpenAPI Documentation**: Auto-generated Swagger UI documentation
+We extend our sincere gratitude to **Kungliga biblioteket (The National Library of Sweden)** for their outstanding work on the **KB-Whisper** models. Their models, trained on extensive Swedish speech data, significantly outperform standard Whisper models on Swedish tasks. This API makes it easy to utilize these models by simply changing the `DEFAULT_MODEL` setting in `.env` to `kblab-large`.
 
-## Requirements
+Visit [KBLab's Whisper models on Hugging Face](https://huggingface.co/KBLab) to learn more.
 
-- **Python 3.8+**
-- **CUDA-compatible GPU** (NVIDIA) with 4GB+ VRAM (8GB+ recommended)
-- **FFmpeg** (for audio processing)
+## 🚀 Quick Start
 
-## Quick Start
+### Using Docker (Recommended)
 
-### Installation
+This provides a consistent environment for deployment.
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/username/whisper-api.git
-   cd whisper-api
-   ```
+1.  **Clone Repository:**
 
-2. Set up a virtual environment:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
+    ```bash
+    git clone https://github.com/CCimen/openai-transcription-api.git
+    cd openai-transcription-api
+    ```
 
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+2.  **Configure Environment (`.env`):**
 
-4. Configure environment variables:
-   ```bash
-   cp .env.example .env
-   # Edit .env file with your settings
-   ```
+    ```bash
+    cp .env.example .env
+    nano .env # Edit the file
+    ```
 
-### Running in Development Mode
+    **Key settings to review:**
 
-```bash
-python run.py --debug
-```
+    - `API_AUTH_REQUIRED=true` (Recommended) & `API_KEY` (Generate: `python -c 'import secrets; print(secrets.token_urlsafe(32))'`)
+    - `HUGGINGFACE_TOKEN` (Required if `DIARIZATION_ENABLED=true`. Get from [HF Settings](https://huggingface.co/settings/tokens)).
+    - `DEFAULT_MODEL`: e.g., `kblab-large`, `large`, `medium`. See `app/config.py` for keys.
+    - `AUTO_DELETE_AFTER_COMPLETION=true` (Recommended for privacy).
+    - `UPLOAD_DIR`, `RESULTS_DIR`: Match `docker-compose.yml` volumes or `tmpfs` paths.
+    - `MAX_CONCURRENT_TASKS`: Adjust based on your GPU VRAM (see `.env.example` comments).
 
-Visit http://localhost:8000/docs to see the API documentation.
+3.  **Build & Run (Docker Compose):**
 
-### Running in Production
+    - **GPU Version:** (Requires NVIDIA Drivers & Container Toolkit)
+      ```bash
+      docker compose build whisper-api
+      docker compose up -d whisper-api
+      ```
+    - **CPU Version:**
+      ```bash
+      docker compose build --build-arg BASE_IMAGE=python:3.10-slim whisper-api
+      docker compose up -d whisper-api
+      ```
 
-```bash
-# Basic production deployment
-python run.py --host 0.0.0.0 --port 8000
+4.  **Access API:**
+    - Docs: `http://localhost:8000/docs` (or your `${PORT}`)
+    - Health: `http://localhost:8000/health/`
 
-# With model preloading
-python run.py --preload-model medium
+### Local Development (using `uv`)
 
-# With memory limits
-python run.py --memory-limit 6.0  # Limit to 6GB VRAM
-```
+1.  **Clone Repository & Install `uv`:** (See [astral.sh/uv](https://astral.sh/uv))
+2.  **Create & Activate Virtual Environment:**
+    ```bash
+    uv venv
+    source .venv/bin/activate # Or relevant activation command
+    ```
+3.  **Install Dependencies:**
+    - **CPU-only (+ Diarization):** `uv pip install -e ".[diarization]"`
+    - **GPU (+ Diarization):** Install PyTorch+CUDA first (see [pytorch.org](https://pytorch.org/)), then `uv pip install -e ".[diarization]"`. Example (CUDA 11.8):
+      ```bash
+      uv pip install torch==2.1.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu118
+      uv pip install -e ".[diarization]"
+      ```
+4.  **Configure Environment (`.env`):** (As in Docker section)
+5.  **Install FFmpeg:** (System dependency: `sudo apt install ffmpeg`, `brew install ffmpeg`, etc.)
+6.  **Run API:**
+    ```bash
+    python app/cli.py --port 8000 # Or use --reload for dev
+    ```
+7.  **Access API:** `http://localhost:8000/docs`
 
-## API Endpoints
+## 🔧 Requirements
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Health check |
-| `/status` | GET | System status, GPU info, and capabilities |
-| `/gpu-status` | GET | Detailed GPU information |
-| `/transcriptions` | POST | Start a new transcription job |
-| `/transcriptions/{job_id}/status` | GET | Check job status and progress |
-| `/transcriptions/{job_id}` | GET | Get transcription results |
-| `/transcriptions/{job_id}` | DELETE | Delete a job |
-| `/docs` | GET | OpenAPI documentation |
+- Python 3.10+
+- `uv` (for local setup)
+- Docker & Docker Compose (for container deployment)
+- NVIDIA GPU + Drivers + Container Toolkit (for GPU in Docker)
+- FFmpeg (system dependency)
+- Hugging Face Token (if using diarization)
 
-## Transcription Workflow
+## ⚙️ Configuration (`.env`)
 
-1. **Submit an audio file** with `POST /transcriptions`
-   ```bash
-   curl -X POST -F "audio_file=@your-audio.mp3" \
-        -F "model_size=medium" \
-        -F "diarization=false" \
-        http://localhost:8000/transcriptions
-   ```
+Key settings explained (see `.env.example` for all):
 
-2. **Get the job ID** from the response
-   ```json
-   {"id": "550e8400-e29b-41d4-a716-446655440000", "status": "pending", "progress": 0.0}
-   ```
+| Variable                       | Description                                                                      | Example            |
+| :----------------------------- | :------------------------------------------------------------------------------- | :----------------- |
+| `DEFAULT_MODEL`                | Model to use by default (`tiny`, `small`, `medium`, `large`, `kblab-large`)      | `kblab-large`      |
+| `USE_CUDA`                     | Use GPU if available (`true`/`false`)                                            | `true`             |
+| `MAX_CONCURRENT_TASKS`         | Max simultaneous processing tasks (adjust based on VRAM)                         | `1`                |
+| `DIARIZATION_ENABLED`          | Globally enable/disable speaker diarization                                      | `true`             |
+| `HUGGINGFACE_TOKEN`            | **Required** for diarization models from Hugging Face                            | `hf_YourTokenHere` |
+| `API_AUTH_REQUIRED`            | Enable API Key authentication (`true`/`false`)                                   | `true`             |
+| `API_KEY`                      | Secret key if auth is enabled                                                    | `YourGeneratedKey` |
+| `UPLOAD_DIR`                   | Path inside container for temporary uploads                                      | `/app/uploads`     |
+| `RESULTS_DIR`                  | Path inside container for temporary results/processing files                     | `/app/results`     |
+| `AUTO_DELETE_AFTER_COMPLETION` | **Privacy**: Delete audio files immediately after task finishes (`true`/`false`) | `true`             |
+| `JOB_CLEANUP_HOURS`            | How long to keep task _metadata_ (results) in memory (0=very short)              | `24`               |
+| `LOG_LEVEL`                    | App logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`)                          | `INFO`             |
 
-3. **Check job status** with `GET /transcriptions/{job_id}/status`
-   ```bash
-   curl http://localhost:8000/transcriptions/550e8400-e29b-41d4-a716-446655440000/status
-   ```
-   
-   Response:
-   ```json
-   {
-     "id": "550e8400-e29b-41d4-a716-446655440000",
-     "status": "transcribing", 
-     "progress": 0.45
-   }
-   ```
+## 🛡️ API Authentication
 
-4. **Get results** when status is "completed"
-   ```bash
-   curl http://localhost:8000/transcriptions/550e8400-e29b-41d4-a716-446655440000
-   ```
-   
-   Response:
-   ```json
-   {
-     "id": "550e8400-e29b-41d4-a716-446655440000",
-     "status": "completed",
-     "progress": 1.0,
-     "transcription": "This is the full transcription text...",
-     "segments": [
-       {
-         "start": 0.0,
-         "end": 2.5,
-         "text": "This is the",
-         "speaker": "SPEAKER_0"
-       },
-       {
-         "start": 2.5,
-         "end": 5.0,
-         "text": "full transcription text",
-         "speaker": "SPEAKER_0"
-       }
-     ],
-     "speakers": ["SPEAKER_0", "SPEAKER_1"],
-     "duration": 5.0,
-     "processing_time": 1.2
-   }
-   ```
+If `API_AUTH_REQUIRED=true` in `.env`:
 
-## Speaker Diarization
-
-Speaker diarization (identifying who said what) is available as an optional feature. To enable it:
-
-1. Get a Hugging Face token with access to `pyannote/speaker-diarization-3.1`
-2. Set these environment variables:
-   ```
-   DIARIZATION_ENABLED=True
-   HUGGINGFACE_TOKEN=your_huggingface_token
-   ```
-3. Install additional dependencies:
-   ```bash
-   pip install pyannote.audio==3.1.1 pydub==0.25.1 numpy<2.0.0
-   ```
-4. Add `diarization=true` parameter when submitting transcription jobs
-
-## Performance Tuning
-
-### Model Selection
-
-Choose the appropriate model size based on your needs:
-
-| Model | VRAM Required | Speed | Accuracy |
-|-------|---------------|-------|----------|
-| tiny | ~1 GB | Fastest | Lowest |
-| small | ~2 GB | Fast | Good |
-| medium | ~4 GB | Medium | Better |
-| large | ~8 GB | Slowest | Best |
-
-### GPU Memory Management
-
-Set these environment variables to control GPU memory usage:
-
-```
-# Keep only the current model in memory (unload others)
-KEEP_MULTIPLE_MODELS_IN_MEMORY=False
-
-# Minimum free VRAM to maintain (GB)
-MIN_FREE_MEMORY_GB=3.0
-```
-
-Or use command-line options:
+1.  Set a strong, unique `API_KEY` in `.env`.
+2.  Clients **must** send this key in the `X-API-Key` HTTP header.
 
 ```bash
-python run.py --memory-limit 6.0
+curl -H "X-API-Key: your_secret_api_key" http://localhost:8000/system/status
 ```
 
-### Processing Long Files
+## 📊 API Endpoints
 
-For very long audio files:
+Access interactive documentation (Swagger UI) at `/docs`.
 
-1. Use the `tiny` or `small` model to conserve memory
-2. Disable diarization or use a smaller chunk size:
-   ```
-   DIARIZATION_CHUNK_DURATION=180  # 3 minutes
-   ```
+- `/transcriptions/` (POST): Submit audio for transcription (+ optional diarization).
+- `/diarize/` (POST): Submit audio for diarization only.
+- `/transcriptions/{id}` / `/diarize/{id}` (GET): Get task results.
+- `/transcriptions/{id}/status` / `/diarize/{id}/status` (GET): Get task status/progress.
+- `/transcriptions/{id}` / `/diarize/{id}` (DELETE): Delete task record and files.
+- `/health/` (GET): Basic API health check.
+- `/system/status` (GET): Detailed system status (GPU, models, queue).
+- `/system/models` (GET): List available models and load status.
+- `/system/models/{name}/load` (POST): Request async model loading.
+- `/system/models/{name}/unload` (POST): Request model unloading.
 
-## Frontend Integration
+## 📖 Basic Usage
 
-This API is designed to work seamlessly with frontend applications. For React applications:
-
-1. Use `fetch` or `axios` to submit audio files
-2. Poll the status endpoint at regular intervals (e.g., every 1-2 seconds)
-3. Update a progress bar based on the `progress` value
-4. Display results when status is `completed`
-
-Example React component available in the `/examples` folder.
-
-## Monitoring and Maintenance
-
-### Health Checks
-
-Monitor the root endpoint for basic availability:
+**Submit Transcription Job:**
 
 ```bash
-curl http://localhost:8000/
+curl -X POST "http://localhost:8000/transcriptions/" \
+  -H "accept: application/json" \
+  # -H "X-API-Key: your_secret_api_key" # Add if auth enabled
+  -F "audio_file=@/path/to/audio.mp3" \
+  -F "language=sv" \
+  -F "model_size=kblab-large" \
+  -F "diarization=true"
 ```
 
-For detailed system status:
+**Response (Example):**
+
+```json
+{
+  "id": "generated-uuid-task-id",
+  "status": "queued", // or pending, preparing, processing
+  "progress": 0.0,
+  "queue_position": 1,
+  "error": null,
+  "model": "whisper-kblab-large"
+  // Other fields null initially
+}
+```
+
+**Check Status:**
 
 ```bash
-curl http://localhost:8000/status
+curl # -H "X-API-Key: your_secret_api_key" \
+  "http://localhost:8000/transcriptions/generated-uuid-task-id/status"
 ```
 
-### Log Files
-
-Logs are written to standard output and can be redirected:
+**Get Results (when status is 'completed'):**
 
 ```bash
-python run.py > whisper-api.log 2>&1
+curl # -H "X-API-Key: your_secret_api_key" \
+  "http://localhost:8000/transcriptions/generated-uuid-task-id"
 ```
 
-### Memory Usage
+## 🔒 Privacy Considerations
 
-Monitor GPU memory usage with the included script:
+This API is designed with privacy in mind:
 
-```bash
-python tools/gpu_monitor.py
-```
+- **File Deletion**: Enable `AUTO_DELETE_AFTER_COMPLETION=true` (default is true in updated code). The TaskManager ensures the original uploaded audio and any temporary processed files (like preprocessed audio for diarization) associated with a task are securely deleted immediately after the task finishes (success, failure, or cancellation).
 
-## Production Deployment
+- **Storage**:
 
-### Running as a Service
+  - **Memory Storage** (Recommended for Privacy): Use tmpfs mounts in `docker-compose.yml` for `UPLOAD_DIR` and `RESULTS_DIR` (e.g., pointing them to `/dev/shm/...`). This ensures audio data resides only in RAM and is gone when the container stops. Requires sufficient host RAM.
+  - **Persistent Storage**: If using standard Docker volumes, the host OS's filesystem security and encryption become important. The application creates directories with restrictive permissions (0o700), but data persists on disk until deleted by the app or volume removal.
 
-Use the included systemd service file:
+- **Task IDs**: Anonymous UUIDs are used.
 
-```bash
-sudo cp deployment/whisper-api.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable whisper-api
-sudo systemctl start whisper-api
-```
+- **Logging**: Set `LOG_LEVEL=INFO` or `WARNING` in production. Filenames might appear in logs; sensitive payload data is avoided. Audit logs (`AUDIT_LOGGING_ENABLED=true`) track request metadata only. Ensure log file permissions are secure.
 
-### Using Supervisor
+- **Authentication**: Strongly recommended. Enable `API_AUTH_REQUIRED=true` and use a strong `API_KEY`.
 
-Sample supervisor configuration included in `deployment/supervisor.conf`.
+- **HTTPS**: Essential for production. Terminate TLS at a reverse proxy (Nginx, Traefik, Cloud Load Balancer) placed in front of the API container.
 
-### Docker (Limited GPU Support)
+## 📄 License
 
-Docker deployment is possible but with limited GPU support. See `deployment/docker` for details.
-
-## Technical Architecture
-
-- **FastAPI**: Web framework for API endpoints
-- **PyTorch**: Deep learning framework for Whisper models
-- **Uvicorn**: ASGI server for production deployment
-- **Whisper Models**: Four model sizes (tiny, small, medium, large)
-- **Pyannote.Audio**: Speaker diarization (optional)
-
-### Memory Optimization Techniques
-
-1. **Model Caching**: Intelligent model caching based on usage
-2. **Memory Management**: Proactive GPU memory cleanup
-3. **Chunked Processing**: Large files processed in manageable chunks
-4. **Optimized FFT**: CPU-forced FFT operations to avoid cuFFT errors
-5. **Progress Tracking**: Detailed progress tracking with minimal overhead
-
-## Contributing
-
-Contributions are welcome! Please check out our [Contributing Guidelines](CONTRIBUTING.md).
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- [OpenAI Whisper](https://github.com/openai/whisper)
-- [KBLab Whisper Models](https://huggingface.co/KBLab)
-- [Pyannote.Audio](https://github.com/pyannote/pyannote-audio)
-- [FastAPI](https://fastapi.tiangolo.com/)
+This project is licensed under the MIT License. (You should add a LICENSE file with the MIT license text to the repository root).

@@ -1,0 +1,84 @@
+# Development Dockerfile (can be CPU or GPU based, focuses on mounting code)
+
+# Use the same base as the production Dockerfile for consistency
+ARG CUDA_VERSION=11.8.0
+ARG CUDNN_VERSION=8
+ARG OS_VERSION=ubuntu22.04
+ARG PYTHON_VERSION=3.10
+ARG BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-cudnn${CUDNN_VERSION}-runtime-${OS_VERSION}
+# To force CPU build for dev:
+# ARG BASE_IMAGE=python:${PYTHON_VERSION}-slim
+FROM ${BASE_IMAGE} AS dev-base
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=off \
+    PIP_DISABLE_PIP_VERSION_CHECK=on \
+    PIP_DEFAULT_TIMEOUT=100 \
+    PATH="/root/.local/bin:/app/.venv/bin:${PATH}" \
+    APP_HOME=/app \
+    PYTHONPATH=${APP_HOME} \
+    DEBIAN_FRONTEND=noninteractive \
+    UV_LINK_MODE=copy \
+    # Dev specific: No bytecode compilation by default for faster sync
+    # UV_COMPILE_BYTECODE=1
+    # Set paths defaults matching compose volume mounts
+    MODELS_CACHE_DIR="/app/models" \
+    UPLOAD_DIR="/app/uploads" \
+    RESULTS_DIR="/app/results"
+
+WORKDIR $APP_HOME
+
+# Install system dependencies (same as prod)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ffmpeg \
+    git \
+    curl \
+    ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install uv (same as prod)
+ARG UV_VERSION=latest
+COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION} /uv /uvx /bin/
+RUN uv --version
+
+# Create venv (same as prod builder)
+RUN uv venv .venv --python $(which python)
+ENV VIRTUAL_ENV=${APP_HOME}/.venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# Copy only dependency files
+COPY pyproject.toml ./
+
+# Install dependencies including development extras
+# Use cache mount
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip sync --extra diarization --extra dev
+    # Note: We sync all deps here. If volumes mount local code later,
+    # the running container will use the mounted code with these deps.
+
+# Create necessary directories (needed for mount points)
+# Create as root first
+RUN mkdir -p ${MODELS_CACHE_DIR} ${UPLOAD_DIR} ${RESULTS_DIR} ${APP_HOME}/logs /app/app
+
+# Create the non-root user (same as prod)
+ARG UID=1001
+ARG GID=1001
+RUN groupadd --gid ${GID} appuser && \
+    useradd --uid ${UID} --gid ${GID} -m appuser
+
+# Set ownership for app home and created dirs so mounted volumes inherit correct permissions if empty
+# Also ensure the user owns the venv
+RUN chown -R appuser:appuser ${APP_HOME}
+
+# Switch to the non-root user
+USER appuser
+
+# Expose the development port (should match DEV_PORT in .env or default)
+EXPOSE 8080
+
+# Command to run the application in development mode with reload
+# Uses uvicorn directly with --reload flag
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
