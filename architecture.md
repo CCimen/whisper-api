@@ -6,6 +6,7 @@ This document outlines the architecture and workflow of the Whisper Transcriptio
 - [Project Structure](#-project-structure)
 - [Core Workflow](#-core-workflow-transcription-task)
 - [Key Components](#-key-components)
+- [API Endpoints](#-api-endpoints)
 - [Adding a New Transcription Model](#-adding-a-new-transcription-model)
 
 ## 📂 Project Structure
@@ -167,6 +168,45 @@ sequenceDiagram
 
 * **Configuration (`app/config.py`)**: 
   Loads settings from environment variables using pydantic-settings
+
+## 📊 API Endpoints
+
+Access interactive documentation at `/docs`
+
+### Health Checks
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health/` | API Health Check |
+
+### System & Monitoring
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/system/status` | Get Overall System Status |
+| `GET` | `/system/gpu` | Get Detailed GPU Status |
+| `GET` | `/system/models` | List Available Models |
+| `POST` | `/system/models/{model_name}/load` | Load a Model |
+| `POST` | `/system/models/{model_name}/unload` | Unload a Model |
+| `GET` | `/system/queue` | Get Task Queue Status |
+
+### Transcription
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/transcriptions/` | Submit Transcription Job |
+| `GET` | `/transcriptions/{task_id}/status` | Get Transcription Job Status |
+| `GET` | `/transcriptions/{task_id}` | Get Transcription Job Result |
+| `DELETE` | `/transcriptions/{task_id}` | Delete Transcription Job |
+
+### Diarization
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/diarize/` | Submit Diarization Only Job |
+| `GET` | `/diarize/{task_id}/status` | Get Diarization Task Status |
+| `GET` | `/diarize/{task_id}` | Get Diarization Task Result |
+| `DELETE` | `/diarize/{task_id}` | Delete Diarization Task |
 
 ## ✨ Adding a New Transcription Model
 
