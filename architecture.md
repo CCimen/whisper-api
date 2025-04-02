@@ -2,6 +2,13 @@
 
 This document outlines the architecture and workflow of the Whisper Transcription API.
 
+## 📋 Table of Contents
+- [Project Structure](#-project-structure)
+- [Core Workflow](#-core-workflow-transcription-task)
+- [Key Components](#-key-components)
+- [API Endpoints](#-api-endpoints)
+- [Adding a New Transcription Model](#-adding-a-new-transcription-model)
+
 ## 📂 Project Structure
 
 The project follows a standard structure for FastAPI applications:
@@ -16,119 +23,231 @@ app/
 ├── services/                 # Core business logic and services
 │   ├── diarization.py        # Speaker diarization service (using pyannote)
 │   ├── model_registry.py     # Manages loading/unloading of transcription models
-│   ├── processor.py          # Orchestrates the audio processing pipeline (transcription + diarization)
+│   ├── processor.py          # Orchestrates the audio processing pipeline
 │   ├── task_manager.py       # Handles asynchronous task queuing and execution
-│   └── transcriber.py        # (Potentially legacy or helper for transcription - Processor is main)
-├── config.py                 # Application configuration (settings loading from .env)
+│   └── transcriber.py        # Helper for transcription
+├── config.py                 # Application configuration (settings from .env)
 ├── exceptions.py             # Custom exception classes
-└── main.py                   # FastAPI application entry point (middleware, lifespan, router inclusion)
+└── main.py                   # FastAPI application entry point
 ```
 
 ## 🌊 Core Workflow (Transcription Task)
 
-The following sequence diagram illustrates the typical flow when a user submits an audio file for transcription:
+### High-Level Overview
+
+The following diagram shows the simplified flow of a transcription request through the system:
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant FastAPI_API as FastAPI API<br>(main.py, routes/transcription.py)
-    participant TaskManager as Task Manager<br>(services/task_manager.py)
-    participant Processor as Audio Processor<br>(services/processor.py)
-    participant ModelRegistry as Model Registry<br>(services/model_registry.py)
-    participant WhisperModel as Whisper Model<br>(models/whisper_model.py)
+    participant API as FastAPI API
+    participant TaskMgr as Task Manager
+    participant Processor as Audio Processor
+    participant Model as Model Components
 
-    User->>+FastAPI_API: POST /transcriptions/ (audio file, params)
-    FastAPI_API->>+TaskManager: create_task(type="transcription", params)
-    TaskManager-->>-FastAPI_API: task_id
-    FastAPI_API->>+TaskManager: queue_task(task_id)
-    TaskManager-->>-FastAPI_API: Queued status (task_id, queue_position)
-    FastAPI_API-->>-User: 202 Accepted (task_id, status="queued")
-
-    Note over TaskManager: Worker becomes available
-    TaskManager->>+Processor: process_audio(task_id, params, callback)
-    Processor->>+ModelRegistry: get_model(model_key)
-    ModelRegistry->>+WhisperModel: Check if loaded
-    alt Model Not Loaded
-        WhisperModel-->>-ModelRegistry: Not loaded
-        ModelRegistry-->>-Processor: Model instance (not loaded)
-        Processor->>TaskManager: Update Status: LOADING_MODEL (via callback)
-        Processor->>+WhisperModel: load(device)
-        Note over WhisperModel: Downloads/loads model weights & pipeline
-        WhisperModel-->>-Processor: Model loaded
-    else Model Already Loaded
-        WhisperModel-->>-ModelRegistry: Loaded
-        ModelRegistry-->>-Processor: Model instance (loaded)
+    User->>API: Submit audio for transcription
+    API->>TaskMgr: Create and queue task
+    API-->>User: Return task ID
+    
+    Note over TaskMgr: Task queued until worker available
+    
+    TaskMgr->>Processor: Process audio file
+    Processor->>Model: Request model & transcribe
+    Model-->>Processor: Return transcription
+    
+    opt Diarization Requested
+        Processor->>Processor: Add speaker identification
     end
-    Processor->>TaskManager: Update Status: PROCESSING (via callback)
-    Processor->>+WhisperModel: transcribe(audio_path, ...)
-    WhisperModel-->>-Processor: Transcription result (text, segments)
-    Processor->>TaskManager: Update Status: COMPLETING (via callback)
-    Note over Processor: Optional: Run Diarization & Assign Speakers
-    Processor->>TaskManager: Update Status: COMPLETED, Result (via callback)
-    Processor-->>-TaskManager: Return final result dict
-
-    Note over User, TaskManager: User polls for status/result later
-    User->>+FastAPI_API: GET /transcriptions/{task_id}
-    FastAPI_API->>+TaskManager: get_task(task_id)
-    TaskManager-->>-FastAPI_API: Task details (status="completed", result)
-    FastAPI_API-->>-User: 200 OK (Transcription result)
-
+    
+    Processor-->>TaskMgr: Store completed result
+    
+    User->>API: Request task result
+    API->>TaskMgr: Get task data
+    TaskMgr-->>API: Return result
+    API-->>User: Deliver transcription
 ```
 
-**Explanation:**
+<details>
+<summary><b>Click to view detailed workflow diagram</b></summary>
 
-1.  **Request:** The user sends a POST request with the audio file and parameters (language, model, diarization flag) to the FastAPI endpoint (`/transcriptions/`).
-2.  **Task Creation:** The API route handler validates the request and calls the `TaskManager` to create a new task record, getting back a unique `task_id`.
-3.  **Queuing:** The task is added to the `TaskManager`'s queue. The API immediately responds to the user with a `202 Accepted` status, including the `task_id` and the current status (e.g., `queued`).
-4.  **Processing:** When a worker slot is free, the `TaskManager` dequeues the task and calls the `Audio Processor` (`process_audio` function).
-5.  **Model Acquisition:** The `Processor` asks the `ModelRegistry` for the required `WhisperModel` instance.
-6.  **Model Loading (if needed):** The `ModelRegistry` checks if the model is loaded. If not, the `Processor` updates the task status to `LOADING_MODEL` (via a callback to the `TaskManager`) and instructs the `WhisperModel` instance to load itself (which might involve downloading from Hugging Face).
-7.  **Transcription:** Once the model is loaded, the `Processor` updates the status to `PROCESSING` and calls the `WhisperModel`'s `transcribe` method.
-8.  **Diarization (Optional):** If requested, the `Processor` calls the `DiarizationService` and then assigns speaker labels to the transcription segments.
-9.  **Completion:** The `Processor` updates the task status to `COMPLETED` via the `TaskManager` callback, storing the final result.
-10. **Result Retrieval:** The user polls the `/transcriptions/{task_id}` endpoint using the `task_id` received earlier. Once the status is `completed`, the API retrieves the result from the `TaskManager` and returns it to the user.
-11. **Cleanup:** The `TaskManager` handles automatic cleanup of associated files based on configuration.
+```mermaid
+sequenceDiagram
+    participant User
+    participant API as FastAPI API
+    participant TaskMgr as Task Manager
+    participant Processor as Audio Processor
+    participant ModelReg as Model Registry
+    participant WhisperMod as Whisper Model
+
+    User->>API: POST /transcriptions/ (audio file, params)
+    API->>TaskMgr: create_task(type="transcription", params)
+    TaskMgr-->>API: task_id
+    API->>TaskMgr: queue_task(task_id)
+    TaskMgr-->>API: Queued status (task_id, queue_position)
+    API-->>User: 202 Accepted (task_id, status="queued")
+
+    Note over TaskMgr: Worker becomes available
+    TaskMgr->>Processor: process_audio(task_id, params, callback)
+    Processor->>ModelReg: get_model(model_key)
+    ModelReg->>WhisperMod: Check if loaded
+    
+    alt Model Not Loaded
+        WhisperMod-->>ModelReg: Not loaded
+        ModelReg-->>Processor: Model instance (not loaded)
+        Processor->>TaskMgr: Update Status: LOADING_MODEL
+        Processor->>WhisperMod: load(device)
+        Note over WhisperMod: Downloads/loads model weights
+        WhisperMod-->>Processor: Model loaded
+    else Model Already Loaded
+        WhisperMod-->>ModelReg: Loaded
+        ModelReg-->>Processor: Model instance (loaded)
+    end
+    
+    Processor->>TaskMgr: Update Status: PROCESSING
+    Processor->>WhisperMod: transcribe(audio_path, ...)
+    WhisperMod-->>Processor: Transcription result
+    
+    opt Diarization Requested
+        Note over Processor: Run Diarization & Assign Speakers
+    end
+    
+    Processor->>TaskMgr: Update Status: COMPLETED, Result
+    Processor-->>TaskMgr: Return final result dict
+
+    Note over User, API: User polls for status/result
+    User->>API: GET /transcriptions/{task_id}
+    API->>TaskMgr: get_task(task_id)
+    TaskMgr-->>API: Task details (status, result)
+    API-->>User: 200 OK (Transcription result)
+```
+</details>
+
+### Workflow Explained:
+
+1. **Request Handling**:
+   - User sends a POST request with audio file and parameters
+   - API validates the request and creates a task
+   - User receives a task ID immediately
+
+2. **Task Processing**:
+   - Task enters queue and waits for an available worker
+   - When processing begins, system checks if the requested model is loaded
+   - If needed, model is loaded from Hugging Face
+   - Audio is transcribed using the Whisper model
+
+3. **Optional Diarization**:
+   - If requested, speaker recognition is performed
+   - Speakers are assigned to transcription segments
+
+4. **Result Retrieval**:
+   - User polls for task status using the task ID
+   - Once completed, transcription results are returned
+
+5. **Cleanup**:
+   - Files are automatically deleted based on configuration
 
 ## 🔑 Key Components
 
-*   **FastAPI (`app/main.py`, `app/api/`)**: Handles HTTP requests, routing, request validation, and response formatting.
-*   **TaskManager (`app/services/task_manager.py`)**: Manages the lifecycle of asynchronous tasks (queuing, execution, status tracking, results, cleanup). Decouples request handling from long-running processing.
-*   **Audio Processor (`app/services/processor.py`)**: Orchestrates the steps involved in processing an audio file: getting the model, running transcription, running diarization (optional), and combining results.
-*   **ModelRegistry (`app/services/model_registry.py`)**: Manages transcription model instances. Handles loading/unloading to manage resources (especially GPU VRAM). Allows different models to be used.
-*   **WhisperModel (`app/models/whisper_model.py`)**: A wrapper around the Hugging Face `transformers` implementation of Whisper. Handles the specifics of loading a model and running the transcription pipeline.
-*   **DiarizationService (`app/services/diarization.py`)**: Handles speaker diarization using `pyannote.audio`.
-*   **Configuration (`app/config.py`)**: Loads settings from environment variables and `.env` files using `pydantic-settings`.
+* **FastAPI (`app/main.py`, `app/api/`)**: 
+  Handles HTTP requests, routing, validation, and responses
+
+* **TaskManager (`app/services/task_manager.py`)**: 
+  Manages asynchronous tasks - queuing, execution, status tracking, and cleanup
+
+* **Audio Processor (`app/services/processor.py`)**: 
+  Orchestrates audio processing steps - model acquisition, transcription, diarization
+
+* **ModelRegistry (`app/services/model_registry.py`)**: 
+  Handles model instances, loading/unloading, and resource management
+
+* **WhisperModel (`app/models/whisper_model.py`)**: 
+  Wraps the Hugging Face implementation of Whisper
+
+* **DiarizationService (`app/services/diarization.py`)**: 
+  Handles speaker diarization using pyannote.audio
+
+* **Configuration (`app/config.py`)**: 
+  Loads settings from environment variables using pydantic-settings
+
+## 📊 API Endpoints
+
+Access interactive documentation at `/docs`
+
+### Health Checks
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health/` | API Health Check |
+
+### System & Monitoring
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/system/status` | Get Overall System Status |
+| `GET` | `/system/gpu` | Get Detailed GPU Status |
+| `GET` | `/system/models` | List Available Models |
+| `POST` | `/system/models/{model_name}/load` | Load a Model |
+| `POST` | `/system/models/{model_name}/unload` | Unload a Model |
+| `GET` | `/system/queue` | Get Task Queue Status |
+
+### Transcription
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/transcriptions/` | Submit Transcription Job |
+| `GET` | `/transcriptions/{task_id}/status` | Get Transcription Job Status |
+| `GET` | `/transcriptions/{task_id}` | Get Transcription Job Result |
+| `DELETE` | `/transcriptions/{task_id}` | Delete Transcription Job |
+
+### Diarization
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/diarize/` | Submit Diarization Only Job |
+| `GET` | `/diarize/{task_id}/status` | Get Diarization Task Status |
+| `GET` | `/diarize/{task_id}` | Get Diarization Task Result |
+| `DELETE` | `/diarize/{task_id}` | Delete Diarization Task |
 
 ## ✨ Adding a New Transcription Model
 
-To add support for a new transcription model (e.g., a different Whisper variant or a completely different ASR model):
+To add support for a new transcription model:
 
-1.  **Implement Model Wrapper:**
-    *   Create a new class in `app/models/` (or modify `whisper_model.py` if it's a Whisper variant).
-    *   This class **must** inherit from `app.services.model_registry.TranscriptionModel`.
-    *   Implement the required methods:
-        *   `__init__(self, model_size: str, ...)`: Initialize with necessary parameters. Call `super().__init__(...)`.
-        *   `load(self, device: Optional[str] = None)`: Logic to load the model weights, processor, pipeline, etc., onto the specified device. Set `self._loaded = True` on success.
-        *   `unload(self)`: Logic to release model resources (delete references, clear GPU cache). Set `self._loaded = False`.
-        *   `is_loaded(self) -> bool`: Return `True` if the model is fully loaded and ready, `False` otherwise.
-        *   `transcribe(self, audio_path: str, language: Optional[str] = None, task: str = "transcribe", ...) -> Dict[str, Any]`: Perform the actual transcription. Must return a dictionary containing at least `"text"` and `"segments"` (list of dicts with `"start"`, `"end"`, `"text"`).
-    *   Add the `@ModelRegistry.register` class decorator above your new model class definition. This makes it discoverable.
+1. **Implement Model Wrapper**:
+   - Create a new class in `app/models/` inheriting from `TranscriptionModel`
+   - Implement required methods:
+     ```python
+     @ModelRegistry.register
+     class MyNewModel(TranscriptionModel):
+         def __init__(self, model_size: str, ...):
+             super().__init__(...)
+             
+         def load(self, device: Optional[str] = None):
+             # Logic to load model weights
+             self._loaded = True
+             
+         def unload(self):
+             # Release resources
+             self._loaded = False
+             
+         def is_loaded(self) -> bool:
+             return self._loaded
+             
+         def transcribe(self, audio_path: str, ...) -> Dict[str, Any]:
+             # Perform transcription
+             return {"text": "...", "segments": [...]}
+     ```
 
-2.  **Update Configuration (`app/config.py`):**
-    *   Add a new key-value pair to the `WHISPER_MODEL_MAPPING` dictionary. The key is the short name you'll use in API requests (e.g., `"my-custom-model"`), and the value is the identifier your model's `__init__` method expects (e.g., its Hugging Face path or a specific size identifier).
+2. **Update Configuration**:
+   ```python
+   # In app/config.py
+   WHISPER_MODEL_MAPPING = {
+       # ... existing models ...
+       "my-custom-model": "huggingface/path-to-your-model",
+   }
+   ```
 
-    ```python
-    # In app/config.py
-    WHISPER_MODEL_MAPPING = {
-        # ... existing models ...
-        "my-custom-model": "huggingface/path-to-your-model",
-        "whisper-tiny-en": "openai/whisper-tiny.en", # Example
-    }
-    ```
+3. **Update Documentation**:
+   - Add your new model to the README.md
 
-3.  **Update `README.md` (Optional but Recommended):**
-    *   Add your new model key to the list of available models in the documentation.
-
-4.  **Restart API:** The application needs to restart to pick up the new model registration and configuration.
-
-Now, users can select your new model using the key you defined in `WHISPER_MODEL_MAPPING` (e.g., `model_size=my-custom-model`) when submitting transcription requests. The `ModelRegistry` and `Processor` will handle loading and using it automatically.
+4. **Restart API**:
+   - The application needs to restart to register the new model
