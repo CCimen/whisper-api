@@ -231,8 +231,7 @@ curl -H "X-API-Key: your_secret_api_key" \
 
 ## ⚙️ Configuration
 
-<details>
-<summary>Key configuration options (expand for details)</summary>
+**Key configuration options**
 
 | Variable | Description | Example |
 |----------|-------------|---------|
@@ -245,7 +244,6 @@ curl -H "X-API-Key: your_secret_api_key" \
 | `AUTO_DELETE_AFTER_COMPLETION` | Delete files after processing | `true` |
 | `JOB_CLEANUP_HOURS` | How long to keep task metadata | `24` |
 
-</details>
 
 ## 🔒 Privacy Considerations
 
