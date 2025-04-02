@@ -425,10 +425,11 @@ class TaskManager:
               logger.error(f"[TASKMGR] Worker task {task_id} failed with unhandled exception: {e}", exc_info=True)
               # Mark the application task as failed if it wasn't already terminal
               with self._task_lock:
-                   task = self.tasks.get(task_id)
+                   task = self.tasks.get(task_id) # Fetch task again inside lock
                    if task and not TaskStatus.is_terminal(task.status):
                         task.update_progress(status=TaskStatus.FAILED, error=f"Worker execution error: {e}")
-                        task.perform_cleanup() # Cleanup on worker failure too
+                        # Cleanup will happen when task is eventually deleted or by periodic cleanup
+                        # task.perform_cleanup() # Removed immediate cleanup call
 
 
          # Clean up memory after task finishes
@@ -507,11 +508,14 @@ class TaskManager:
         except asyncio.CancelledError:
              # Handle cancellation initiated by cancel_task() or shutdown()
              with self._task_lock:
-                 task = self.tasks.get(task_id)
+                 task = self.tasks.get(task_id) # Fetch task again inside lock
+                 task_type = task.type if task else "unknown" # Get type before potential deletion
                  if task and task.status != TaskStatus.CANCELLED: # Ensure status is updated if not already
                       task.update_progress(status=TaskStatus.CANCELLED, info={"stage": "task_cancelled"})
-                 logger.info(f"[TASKMGR] Task {task_id} (Type: {task.type}) execution was cancelled.")
-                 if task: task.perform_cleanup()
+                 # Log safely, checking if task exists
+                 logger.info(f"[TASKMGR] Task {task_id} (Type: {task_type}) execution was cancelled.")
+                 # Cleanup will happen when task is eventually deleted or by periodic cleanup
+                 # if task: task.perform_cleanup() # Removed immediate cleanup call
 
 
         except Exception as e:
@@ -524,8 +528,9 @@ class TaskManager:
 
                  # Check if cancelled during execution
                  if task.status == TaskStatus.CANCELLED:
-                      logger.info(f"[TASKMGR] Task {task_id} (Type: {task.type}) failed but was already cancelled.")
-                      task.perform_cleanup()
+                      logger.info(f"[TASKMGR] Task {task_id} (Type: {task.type if task else 'unknown'}) failed but was already cancelled.")
+                      # Cleanup will happen when task is eventually deleted or by periodic cleanup
+                      # task.perform_cleanup() # Removed immediate cleanup call
                       return # Don't retry cancelled tasks
 
                  # Handle retries
@@ -539,8 +544,9 @@ class TaskManager:
                      task.update_progress(status=TaskStatus.FAILED, error=str(e), info={"stage": "task_failed_max_retries"})
                      # Enhanced Failure Log
                      duration = task.completed_at - task.started_at if task.completed_at and task.started_at else 0
-                     logger.error(f"[TASKMGR] Task {task_id} (Type: {task.type}) failed permanently after {task.retry_count} retries in {duration:.2f}s. Final Error: {task.error}")
-                     task.perform_cleanup() # Cleanup on final failure
+                     logger.error(f"[TASKMGR] Task {task_id} (Type: {task.type if task else 'unknown'}) failed permanently after {task.retry_count} retries in {duration:.2f}s. Final Error: {task.error}")
+                     # Cleanup will happen when task is eventually deleted or by periodic cleanup
+                     # task.perform_cleanup() # Removed immediate cleanup call
 
             # If retry is needed, re-queue the task
             if should_retry:
@@ -640,8 +646,8 @@ class TaskManager:
             elif task_id in self._active_workers:
                  async_worker_task_to_cancel = self._active_workers.get(task_id)
 
-            # If cancelled, perform cleanup now
-            task.perform_cleanup()
+            # If cancelled, the worker wrapper or periodic cleanup will handle file cleanup
+            # task.perform_cleanup() # Removed immediate cleanup call
 
         # Cancel the asyncio task outside the lock
         if async_worker_task_to_cancel and not async_worker_task_to_cancel.done():
@@ -668,8 +674,8 @@ class TaskManager:
             task = self.tasks.pop(task_id, None) # Remove from dict atomically
             if task:
                  logger.info(f"[TASKMGR] Deleting task record {task_id} (Type: {task.type})...")
-                 # Ensure cleanup is performed
-                 task.perform_cleanup()
+                 # Cleanup is deferred to worker completion or periodic cleanup
+                 # task.perform_cleanup() # Removed immediate cleanup call
                  # Also ensure it's removed from active workers if somehow still there
                  if task_id in self._active_workers:
                       worker = self._active_workers.pop(task_id)

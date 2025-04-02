@@ -126,9 +126,10 @@ class WhisperModel(TranscriptionModel):
             target_device, torch_dtype = self._get_compute_settings(target_device_str)
 
             try:
-                # Clean memory before loading large model
-                gc.collect()
+                # Clean memory before loading large model (Removed explicit gc.collect/empty_cache)
+                # gc.collect()
                 if target_device.type == "cuda":
+                    # torch.cuda.empty_cache() # Removed explicit call
                     torch.cuda.empty_cache()
 
                 # Load model using optimal settings from config
@@ -212,13 +213,13 @@ class WhisperModel(TranscriptionModel):
             del model_obj
             del processor_obj
 
-            # Force garbage collection and clear CUDA cache
-            gc.collect()
-            if self._loaded_device and self._loaded_device.type == "cuda" and torch and torch.cuda.is_available():
-                 try:
-                      torch.cuda.empty_cache()
-                 except Exception as e:
-                      logger.warning(f"[MODEL:{self.name}] Error emptying CUDA cache during unload: {e}")
+            # Force garbage collection and clear CUDA cache (Removed explicit calls)
+            # gc.collect()
+            # if self._loaded_device and self._loaded_device.type == "cuda" and torch and torch.cuda.is_available():
+            #      try:
+            #           torch.cuda.empty_cache()
+            #      except Exception as e:
+            #           logger.warning(f"[MODEL:{self.name}] Error emptying CUDA cache during unload: {e}")
 
             self._loaded_device = None
             self._loaded_dtype = None
@@ -342,10 +343,10 @@ class WhisperModel(TranscriptionModel):
 
         except Exception as e:
             logger.exception(f"[MODEL:{self.name}] Pipeline execution failed: {e}")
-            # Clean up memory on error
-            gc.collect()
-            if self._loaded_device and self._loaded_device.type == "cuda":
-                torch.cuda.empty_cache()
+            # Clean up memory on error (Removed explicit calls)
+            # gc.collect()
+            # if self._loaded_device and self._loaded_device.type == "cuda":
+            #     torch.cuda.empty_cache()
             raise TranscriptionError(f"[MODEL:{self.name}] Transcription pipeline failed: {e}")
 
         # Process results
@@ -389,10 +390,10 @@ class WhisperModel(TranscriptionModel):
 
         if progress_callback: progress_callback(1.0) # Final progress
 
-        # Clean memory after successful transcription
-        gc.collect()
-        if self._loaded_device and self._loaded_device.type == "cuda":
-            torch.cuda.empty_cache()
+        # Clean memory after successful transcription (Removed explicit calls)
+        # gc.collect()
+        # if self._loaded_device and self._loaded_device.type == "cuda":
+        #     torch.cuda.empty_cache()
 
         return {
             "text": full_text.strip(),

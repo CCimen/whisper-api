@@ -61,8 +61,9 @@ ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 COPY pyproject.toml ./
 
 # Install dependencies AND the project with extras using uv pip install
+# Install dependencies AND the project with extras using uv pip install, plus uvloop
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install -e ".[diarization]"
+    uv pip install -e ".[diarization]" uvloop "numpy<2.0"
 
 
 # Stage 3: Application Stage
@@ -81,8 +82,10 @@ RUN groupadd --gid ${GID} appuser && \
 COPY --from=builder ${APP_HOME}/.venv ${APP_HOME}/.venv
 
 # Copy the application code BEFORE changing user, owned by root initially
-COPY ./app ./app
-COPY ./run.py .
+COPY ./app ${APP_HOME}/app
+COPY ./run.py ${APP_HOME}/run.py
+COPY ./app/logging_config.py ${APP_HOME}/app/logging_config.py
+COPY ./run_uvicorn.py ${APP_HOME}/run_uvicorn.py
 
 # Create necessary APP directories as ROOT first
 RUN mkdir -p ${APP_HOME}/uploads ${APP_HOME}/results ${APP_HOME}/logs
@@ -96,9 +99,9 @@ ENV TRANSFORMERS_CACHE=${HF_HOME}/hub
 # We create it here because the user exists now. chown is important.
 RUN mkdir -p ${HF_HOME} && chown -R appuser:appuser /home/appuser/.cache
 
-# Change ownership of application code, uploads, results, logs directories
+# Change ownership of application code, uploads, results, logs, logging config, and run script
 # Leave .venv owned by root, as only execution is needed
-RUN chown -R appuser:appuser ${APP_HOME}/app ${APP_HOME}/run.py ${APP_HOME}/uploads ${APP_HOME}/results ${APP_HOME}/logs
+RUN chown -R appuser:appuser ${APP_HOME}/app ${APP_HOME}/run.py ${APP_HOME}/app/logging_config.py ${APP_HOME}/run_uvicorn.py ${APP_HOME}/uploads ${APP_HOME}/results ${APP_HOME}/logs
 # Ownership of /home/appuser/.cache was set earlier
 
 # Update PATH for the final non-root user environment AFTER venv is copied
@@ -111,4 +114,6 @@ USER appuser
 EXPOSE 8000
 
 # Define the command to run the application using uvicorn via the activated venv
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Define the command to run the application using the wrapper script
+# The wrapper script applies logging config and then runs uvicorn
+CMD ["python", "run_uvicorn.py"]

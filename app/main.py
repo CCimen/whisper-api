@@ -8,6 +8,8 @@ exception handling, and includes API routers.
 import os
 import asyncio
 import logging
+# import json # No longer needed for JSON logging here
+# from logging.handlers import RotatingFileHandler # Already imported for audit, but good practice
 from rich.logging import RichHandler
 from rich.console import Console
 from rich.theme import Theme
@@ -30,6 +32,12 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.security import APIKeyHeader
+# Import for Prometheus metrics
+from starlette_exporter import PrometheusMiddleware, handle_metrics
+# Import for rate limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Install rich traceback handler
 install_rich_traceback(show_locals=True)
@@ -123,11 +131,9 @@ CUSTOM_THEME = Theme({
     "file.duration": "italic bright_white",
 })
 
-# Configure logging FIRST (using RichHandler)
-logger = logging.getLogger()  # Get root logger
-# Clear existing handlers if any
-if logger.hasHandlers():
-    logger.handlers.clear()
+# Logging will be configured via --log-config passed to Uvicorn
+# Get logger instance for this module
+logger = logging.getLogger(__name__)
 
 # Import exceptions FIRST so they are available for the try/except block
 try:
@@ -162,63 +168,8 @@ except Exception as e:
     print(f"[bold red]CRITICAL:[/bold red] Unexpected error during initial imports or TaskManager creation: {e}")
     exit(1)
 
-# --- Configure Logging Handlers using Settings ---
-log_level_from_settings = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
-logger.setLevel(log_level_from_settings)  # Set level on the root logger
-
-# Create a Console instance that forces terminal output (for colors in Docker)
-force_console = Console(
-    force_terminal=True, 
-    width=120,
-    theme=CUSTOM_THEME,
-    highlight=True
-)
-
-# Custom log formatter function
-def format_log_message(message):
-    if isinstance(message, str) and not message.startswith("["):
-        return message
-    return message
-
-# Define keywords to highlight in logs
-LOG_KEYWORDS = [
-    # Task management status changes
-    "Status changed", "queued", "preparing", "processing", "completed", "failed",
-    
-    # Model components
-    "whisper-kblab-tiny", "whisper-kblab-small", "whisper-kblab-medium", "whisper-kblab-large", 
-    "whisper-base", "whisper-openai-large-v3",
-    
-    # System components
-    "[MODEL]", "[PROCESSOR]", "[TASKMGR]", "[TASKR]", "[Preload Task]",
-    
-    # Duration and metrics
-    "Duration=", "bytes)", "factor:", "Segments:", "Speakers:",
-    
-    # Request patterns
-    "GET /health", "POST /transcriptions", "Request started", "Request finished"
-]
-
-# Create and add RichHandler using the forced console
-rich_handler = RichHandler(
-    console=force_console,  # Use the console that forces colors
-    rich_tracebacks=True,
-    tracebacks_show_locals=settings.DEBUG,  # Show locals in tracebacks only if DEBUG is True
-    markup=True,  # Enable Rich markup in log messages
-    show_path=False,  # Don't show the source file path/line number
-    show_time=True,   # Show timestamp
-    show_level=True,  # Show log level
-    log_time_format="[%X]",
-    omit_repeated_times=False,
-    keywords=LOG_KEYWORDS,  # Words to highlight in log messages
-    highlighter=None,  # We'll use our custom markup instead of default highlighting
-)
-
-rich_handler.setLevel(log_level_from_settings)
-logger.addHandler(rich_handler)
-
-logger = logging.getLogger(__name__)  # Get specific logger for this module
-logger.info(f"[app.title]Logging configured with RichHandler.[/app.title] Level set to: [config.value]{settings.LOG_LEVEL.upper()}[/config.value]")
+# --- Audit Logging Setup (Remains here as it needs settings) ---
+# (Audit logging code remains unchanged)
 
 # --- Audit Logging Setup ---
 audit_logger = None
@@ -412,6 +363,9 @@ async def lifespan(app: FastAPI):
     """Handles application startup and shutdown events using async context manager."""
     # === Startup ===
     start_time = time.time()
+    # Logging is now handled by Uvicorn's --log-config, setup happens before lifespan
+
+    # --- Continue with Startup ---
     app_title = Text(f"--- Starting {settings.APP_NAME} v{settings.APP_VERSION} ---")
     app_title.stylize("bold magenta")
     logger.info(app_title)
@@ -448,8 +402,9 @@ async def lifespan(app: FastAPI):
     # Start periodic cleanup task
     cleanup_task = asyncio.create_task(run_periodic_cleanup())
 
-    startup_duration = time.time() - start_time
-    logger.info(f":rocket: [success]Application startup complete[/success] ([config.value]{startup_duration:.2f}s[/config.value])")
+    # Uvicorn handles its own startup complete message when using --log-config
+    # We can log specific app-level readiness if needed, but the basic message is covered.
+    # logger.info("Application components initialized.") # Example
 
     yield  # Application runs here
 
@@ -509,6 +464,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# --- Rate Limiter Setup ---
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+# Construct rate limit string from settings if enabled
+rate_limit_value = None
+if settings.RATE_LIMITING_ENABLED:
+    rate_limit_value = f"{settings.RATE_LIMIT_REQUESTS}/{settings.RATE_LIMIT_WINDOW_SECONDS}s"
+    logger.info(f"Rate limiting enabled: {rate_limit_value}")
+
 # --- Middleware Configuration ---
 # CORS Middleware
 app.add_middleware(
@@ -518,6 +483,8 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*", "X-API-Key", "Authorization", "Content-Type"],
 )
+# Prometheus Middleware (Add BEFORE other custom middleware if possible)
+app.add_middleware(PrometheusMiddleware)
 # GZip Middleware
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 # Security Headers Middleware
@@ -677,13 +644,23 @@ from app.api.router_registry import (
 )
 # Import route modules AFTER app/handlers defined
 from app.api.routes import health, system, transcription, diarization
-# Define dependencies
-api_dependencies = [Depends(get_api_key)] if settings.API_AUTH_REQUIRED else []
+# Define base dependencies (API key)
+base_api_dependencies = [Depends(get_api_key)] if settings.API_AUTH_REQUIRED else []
+
+# Define rate limited dependencies
+rate_limited_api_dependencies = base_api_dependencies[:] # Copy base dependencies
+if rate_limit_value:
+    rate_limited_api_dependencies.append(Depends(limiter.limit(rate_limit_value)))
+
 # Include routers
-app.include_router(router_health, prefix="/health")
-app.include_router(router_system, dependencies=api_dependencies)
-app.include_router(router_transcription, dependencies=api_dependencies)
-app.include_router(router_diarization, dependencies=api_dependencies)
+app.include_router(router_health, prefix="/health") # Health check should not be rate limited
+app.include_router(router_system, dependencies=rate_limited_api_dependencies)
+app.include_router(router_transcription, dependencies=rate_limited_api_dependencies)
+app.include_router(router_diarization, dependencies=rate_limited_api_dependencies)
+
+# --- Metrics Endpoint ---
+# Add route for Prometheus metrics
+app.add_route("/metrics", handle_metrics)
 
 # --- Root Endpoint ---
 @app.get("/", include_in_schema=False)

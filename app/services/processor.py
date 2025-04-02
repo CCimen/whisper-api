@@ -215,6 +215,10 @@ async def run_diarization(
         user_num_speakers = task_params.get('num_speakers')
         user_min_speakers = task_params.get('min_speakers')
         user_max_speakers = task_params.get('max_speakers')
+        # Extract new hyperparameters
+        segmentation_onset = task_params.get('segmentation_onset')
+        clustering_threshold = task_params.get('clustering_threshold')
+        segmentation_min_duration_off = task_params.get('segmentation_min_duration_off')
 
         # Execute diarization using the service instance
         # Pass task_id for better temporary file management if needed
@@ -223,6 +227,11 @@ async def run_diarization(
             num_speakers=user_num_speakers,
             min_speakers=user_min_speakers,
             max_speakers=user_max_speakers,
+            # Pass new hyperparameters
+            segmentation_onset=segmentation_onset,
+            clustering_threshold=clustering_threshold,
+            segmentation_min_duration_off=segmentation_min_duration_off,
+            # Other params
             progress_callback=progress_callback, # Pass the scaled callback directly
             language=language,
             task_id=task_id # Pass task_id
@@ -371,10 +380,10 @@ async def process_audio(
         diarization_scaled_cb = _create_scaled_callback(progress_callback, diarization_weight, diarization_start_progress)
 
         logger.info(f"[PROCESSOR][{task_id}] Starting diarization step...")
-        # Ensure GPU memory is clear if possible before starting diarization
-        gc.collect()
-        if settings.USE_CUDA and torch and torch.cuda.is_available():
-             torch.cuda.empty_cache()
+        # Ensure GPU memory is clear if possible before starting diarization (Removed explicit calls)
+        # gc.collect()
+        # if settings.USE_CUDA and torch and torch.cuda.is_available():
+        #      torch.cuda.empty_cache()
 
         try:
             diarization_df = await run_diarization(
@@ -448,10 +457,10 @@ async def process_audio(
          if enable_diarization: # Log only if user requested it but it failed/was unavailable
              logger.warning(f"[PROCESSOR][{task_id}] Speaker assignment skipped: No valid diarization data was available.")
 
-    # --- Cleanup ---
-    gc.collect()
-    if settings.USE_CUDA and torch and torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # --- Cleanup --- (Removed explicit calls)
+    # gc.collect()
+    # if settings.USE_CUDA and torch and torch.cuda.is_available():
+    #     torch.cuda.empty_cache()
 
     # Final completion signal
     if progress_callback:
@@ -474,7 +483,7 @@ def assign_speakers_to_segments(
     transcript_result: Dict[str, Any],
     min_overlap_ratio: float = 0.1, # Min overlap needed to consider assignment
     confidence_threshold: float = 0.5, # Confidence threshold for weighted overlap
-    fill_nearest_threshold_sec: float = 3.0 # Max distance for nearest speaker fallback
+    fill_nearest_threshold_sec: float = 1.5 # Max distance for nearest speaker fallback (Reduced from 3.0)
 ) -> Dict[str, Any]:
     """
     Assign speakers from diarization results to transcription segments.
@@ -608,8 +617,10 @@ def assign_speakers_to_segments(
 
     logger.info(f"[PROCESSOR][ASSIGN] Speaker assignment stats: Overlap={num_assigned_overlap}, Nearest={num_assigned_nearest}, Unassigned={num_unassigned} / Total={len(transcript_segments)}")
 
-    # --- Optional Post-processing (Continuity Correction) ---
-    # Could add logic here to smooth assignments (e.g., fix short A-B-A patterns)
+    # --- Post-processing: Merge adjacent segments with same speaker ---
+    merged_segments = _merge_adjacent_segments(transcript_segments)
+    transcript_result["segments"] = merged_segments
+    logger.info(f"[PROCESSOR][ASSIGN] Segment merging reduced segments from {len(transcript_segments)} to {len(merged_segments)}")
 
     return transcript_result # Return modified dict
 
@@ -636,30 +647,62 @@ def _find_nearest_speaker(seg_start, seg_end, diarize_df) -> Tuple[Optional[str]
          return None, float('inf')
 
 
+def _merge_adjacent_segments(segments: List[Dict[str, Any]], max_gap_sec: float = 0.15) -> List[Dict[str, Any]]:
+    """Merges adjacent segments if they have the same speaker and the gap is small."""
+    if not segments:
+        return []
+
+    merged = []
+    current_segment = segments[0].copy() # Start with the first segment
+
+    for i in range(1, len(segments)):
+        next_segment = segments[i]
+        gap = next_segment['start'] - current_segment['end']
+
+        # Check for same speaker (and speaker is not None) and small gap
+        if (current_segment.get('speaker') is not None and
+            current_segment.get('speaker') == next_segment.get('speaker') and
+            0 <= gap <= max_gap_sec):
+            # Merge: extend end time and combine text (handle potential word timings later if needed)
+            current_segment['end'] = next_segment['end']
+            # Simple text concatenation, might need refinement if word timestamps exist
+            current_segment['text'] += " " + next_segment['text']
+            # If merging word timestamps, logic would go here
+        else:
+            # No merge possible, add the completed current segment and start new
+            merged.append(current_segment)
+            current_segment = next_segment.copy()
+
+    # Add the last segment (either merged or the original last one)
+    merged.append(current_segment)
+
+    return merged
+
+
 def _log_speaker_count_warnings(task_params, assigned_speakers, audio_duration):
-     """Logs warnings if detected speaker count mismatches requested parameters."""
-     detected_count = len(assigned_speakers)
-     user_num = task_params.get('num_speakers')
-     user_min = task_params.get('min_speakers')
-     user_max = task_params.get('max_speakers')
+    """Logs warnings if detected speaker count mismatches requested parameters."""
+    detected_count = len(assigned_speakers)
+    user_num = task_params.get('num_speakers')
+    user_min = task_params.get('min_speakers')
+    user_max = task_params.get('max_speakers')
 
-     if user_num is not None:
-         if detected_count != user_num:
-              logger.warning(f"[PROCESSOR][WARN] Detected {detected_count} speakers, but user requested exactly {user_num}.")
-     else:
-         # Determine effective min/max used by diarization if user didn't specify
-         effective_min = user_min if user_min is not None else 1
-         if user_max is None:
-              default_max = 10 if audio_duration > 1800 else (8 if audio_duration > 600 else 6)
-              effective_max = max(default_max, effective_min)
-         else:
-              effective_max = max(user_max, effective_min)
+    if user_num is not None:
+        if detected_count != user_num:
+             logger.warning(f"[PROCESSOR][WARN] Detected {detected_count} speakers, but user requested exactly {user_num}.")
+    else:
+        # Determine effective min/max used by diarization if user didn't specify
+        effective_min = user_min if user_min is not None else 1
+        if user_max is None:
+             default_max = 10 if audio_duration > 1800 else (8 if audio_duration > 600 else 6)
+             effective_max = max(default_max, effective_min)
+        else:
+             effective_max = max(user_max, effective_min)
 
-         if detected_count < effective_min:
-              logger.warning(f"[PROCESSOR][WARN] Detected only {detected_count} speakers, below the minimum requested/default of {effective_min}.")
-         # Check against effective_max, not user_max directly unless user_max was provided
-         if detected_count > effective_max:
-              logger.warning(f"Detected {detected_count} speakers, exceeding the maximum requested/default of {effective_max}.")
+        if detected_count < effective_min:
+             logger.warning(f"[PROCESSOR][WARN] Detected only {detected_count} speakers, below the minimum requested/default of {effective_min}.")
+        # Check against effective_max, not user_max directly unless user_max was provided
+        if detected_count > effective_max:
+             logger.warning(f"[PROCESSOR][WARN] Detected {detected_count} speakers, exceeding the maximum requested/default of {effective_max}.")
 
 
 async def handle_diarization_only(
@@ -755,11 +798,11 @@ async def handle_diarization_only(
         "processing_time": time.time() - start_time
     }
 
-    # --- Cleanup ---
-    gc.collect()
-    if settings.USE_CUDA and torch and torch.cuda.is_available():
-        logger.debug(f"[PROCESSOR][{task_id}] Clearing CUDA cache after diarization-only task.")
-        torch.cuda.empty_cache()
+    # --- Cleanup --- (Removed explicit calls)
+    # gc.collect()
+    # if settings.USE_CUDA and torch and torch.cuda.is_available():
+    #     logger.debug(f"[PROCESSOR][{task_id}] Clearing CUDA cache after diarization-only task.")
+    #     torch.cuda.empty_cache()
 
     # Final completion signal
     if progress_callback:

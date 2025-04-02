@@ -69,14 +69,14 @@ def detect_system_capabilities() -> Dict[str, Any]:
             capabilities["total_memory_gb"] = round(total_mem, 2)
 
             if hasattr(torch.cuda, 'mem_get_info'):
-                # Ensure device index is valid
-                device_idx = 0 # Default to 0
-                if settings and settings.CUDA_DEVICE < capabilities["device_count"]:
-                     device_idx = settings.CUDA_DEVICE
-                elif capabilities["device_count"] > 0:
-                     logger.warning(f"Defaulting memory check to device 0, configured device {getattr(settings,'CUDA_DEVICE', 'N/A')} might be invalid.")
-                else: # No devices, skip mem check
-                     return capabilities
+                # Ensure device index is valid - Cannot access settings here reliably at import time.
+                # Defaulting memory check to device 0. The actual device used is set later.
+                device_idx = 0
+                # if settings and settings.CUDA_DEVICE < capabilities["device_count"]: # Cannot access settings here
+                #      device_idx = settings.CUDA_DEVICE
+                # elif capabilities["device_count"] > 0:
+                #      logger.warning(f"Defaulting memory check to device 0, configured device {getattr(settings,'CUDA_DEVICE', 'N/A')} might be invalid.")
+                # Removed problematic else/return block that caused syntax error
 
                 free_mem_bytes, _ = torch.cuda.mem_get_info(device_idx)
                 capabilities["free_memory_gb"] = round(free_mem_bytes / (1024**3), 2)

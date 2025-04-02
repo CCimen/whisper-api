@@ -6,6 +6,7 @@ import os
 import shutil
 import logging
 import uuid
+import asyncio
 from typing import List, Optional, Dict, Any
 
 from fastapi import (
@@ -60,6 +61,22 @@ class DiarizationRequest(BaseModel):
         default=None,
         ge=1,
         description="Maximum number of speakers expected (used if num_speakers is not set)."
+    )
+    # --- Pyannote Hyperparameters ---
+    segmentation_onset: Optional[float] = Field(
+        default=None, # Pipeline default usually ~0.5
+        description="Speech activity detection onset threshold (probability). Higher values require more confidence (e.g., 0.7), lower values are more sensitive (e.g., 0.3). Default ~0.5.",
+        examples=[0.3, 0.5, 0.7]
+    )
+    clustering_threshold: Optional[float] = Field(
+        default=None, # Pipeline default varies, e.g., ~0.7 for pyannote/speaker-diarization-3.1
+        description="Speaker clustering threshold (distance/similarity). Lower values merge more (e.g., 0.5), higher values require more distinct speakers (e.g., 0.8). Model-dependent, requires experimentation.",
+        examples=[0.5, 0.7, 0.8]
+    )
+    segmentation_min_duration_off: Optional[float] = Field(
+        default=None, # Pipeline default usually ~0.0 or 0.1
+        description="Minimum silence duration (seconds) to split speech segments. Increasing merges segments separated by shorter pauses (e.g., 0.5). Default ~0.0-0.1.",
+        examples=[0.0, 0.1, 0.5]
     )
 
     @validator('max_speakers')
@@ -145,6 +162,10 @@ async def submit_diarization_only_job(
             "num_speakers": request_params.num_speakers,
             "min_speakers": request_params.min_speakers,
             "max_speakers": request_params.max_speakers,
+            # Add new hyperparameters
+            "segmentation_onset": request_params.segmentation_onset,
+            "clustering_threshold": request_params.clustering_threshold,
+            "segmentation_min_duration_off": request_params.segmentation_min_duration_off,
         }
         task_params = {k: v for k, v in task_params.items() if v is not None} # Filter None
 
@@ -227,10 +248,72 @@ async def delete_diarization_task(task_id: str):
      # API Key Dependency applied at the router level in main.py
     """
     Delete a diarization-only task record and associated temporary files.
+    If the task is running, it will be cancelled first.
     """
-    deleted = task_manager.delete_task(task_id)
-    if not deleted:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Task ID '{task_id}' not found or already deleted.")
+    # 1. Get task info and validate
+    task_info = task_manager.get_task(task_id, include_result=False)
+    if not task_info:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Task ID '{task_id}' not found.")
+    if task_info.get("type") != "diarization_only":
+        # This check might be redundant if get_task already filters, but good for clarity
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Task ID '{task_id}' is not a diarization_only task.")
 
-    logger.info(f"Deleted diarization task {task_id}")
-    return None
+    current_status = TaskStatus(task_info["status"]) # Convert string back to enum
+
+    # 2. Check if already terminal
+    if TaskStatus.is_terminal(current_status):
+        logger.info(f"Task {task_id} is already in terminal state ({current_status}). Proceeding with deletion.")
+    else:
+        # 3. Cancel the task if active or queued
+        logger.info(f"Task {task_id} is in state {current_status}. Attempting cancellation before deletion.")
+        try:
+            cancelled_successfully = await task_manager.cancel_task(task_id)
+            if not cancelled_successfully:
+                 # This might happen if the task finished between the get_task and cancel_task calls
+                 logger.warning(f"Cancellation signal for task {task_id} returned False. Checking status again.")
+                 task_info = task_manager.get_task(task_id, include_result=False)
+                 if task_info and not TaskStatus.is_terminal(TaskStatus(task_info["status"])):
+                      # If still not terminal after failed cancel signal, something is wrong
+                      raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to effectively cancel task {task_id} before deletion.")
+
+            # 4. Wait for cancellation to complete (polling)
+            wait_start_time = asyncio.get_event_loop().time()
+            timeout_seconds = 30.0 # Adjust as needed
+            poll_interval = 0.5   # Adjust as needed
+
+            while True:
+                task_info = task_manager.get_task(task_id, include_result=False)
+                if not task_info: # Task might have been deleted concurrently? Unlikely but possible
+                    logger.warning(f"Task {task_id} disappeared during cancellation wait.")
+                    return None # Treat as deleted
+
+                current_status = TaskStatus(task_info["status"])
+                if TaskStatus.is_terminal(current_status):
+                    logger.info(f"Task {task_id} reached terminal state ({current_status}) after cancellation request.")
+                    break # Exit loop, ready to delete
+
+                if (asyncio.get_event_loop().time() - wait_start_time) > timeout_seconds:
+                    logger.error(f"Timeout waiting for task {task_id} to reach terminal state after cancellation request. Proceeding with deletion anyway.")
+                    # Optionally raise 500 here instead?
+                    # raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Timeout waiting for task {task_id} to cancel.")
+                    break # Exit loop, attempt deletion despite timeout
+
+                await asyncio.sleep(poll_interval)
+
+        except Exception as e:
+             logger.error(f"Error during cancellation/wait for task {task_id}: {e}", exc_info=True)
+             # Decide if deletion should still be attempted or raise 500
+             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error cancelling task {task_id}: {e}")
+
+
+    # 5. Delete the task record (now that it's terminal or timed out)
+    deleted = task_manager.delete_task(task_id) # delete_task handles the actual file cleanup
+    if not deleted:
+         # This could happen if the task was deleted by another process between wait and delete
+         logger.warning(f"Attempted to delete task {task_id}, but it was not found (possibly deleted concurrently).")
+         # Return 204 anyway, as the desired state (deleted) is achieved
+         # Alternatively, could raise 404 here, but 204 seems more idempotent
+         # raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Task ID '{task_id}' not found during final deletion step.")
+
+    logger.info(f"Successfully processed deletion request for diarization task {task_id}")
+    return None # Return None for 204 No Content

@@ -28,6 +28,8 @@ dependencies = [
     "GPUtil>=1.4.0,<1.5.0", # For GPU monitoring (optional but useful)
     "rich>=13.0.0,<14.0.0", # For enhanced logging output
     # tabulate removed as it wasn't used
+    "starlette-exporter>=0.20.0,<0.22.0", # For Prometheus metrics
+    "slowapi>=0.1.9,<0.2.0", # For rate limiting
 ]
 
 [project.optional-dependencies]

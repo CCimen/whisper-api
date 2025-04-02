@@ -96,7 +96,11 @@ class DiarizationService:
         self._device = self._get_device()
         self._chunk_duration_sec = self._determine_optimal_chunk_size()
         self._apply_optimizations()
-        logger.info(f"[DIARIZATION] DiarizationService initialized. Device: {self._device}, Chunk Duration: {self._chunk_duration_sec}s")
+        # Initialize semaphore for limiting chunk concurrency
+        # TODO: Make limit configurable via settings.DIARIZATION_MAX_CHUNK_CONCURRENCY
+        self._chunk_concurrency_limit = getattr(settings, 'DIARIZATION_MAX_CHUNK_CONCURRENCY', 4)
+        self._chunk_semaphore = asyncio.Semaphore(self._chunk_concurrency_limit)
+        logger.info(f"[DIARIZATION] DiarizationService initialized. Device: {self._device}, Chunk Duration: {self._chunk_duration_sec}s, Chunk Concurrency: {self._chunk_concurrency_limit}")
 
     def _get_device(self) -> torch.device:
         """Determine the appropriate torch device."""
@@ -207,8 +211,8 @@ class DiarizationService:
             load_start_time = time.time()
 
             try:
-                # Clean memory before loading
-                gc.collect()
+                # Clean memory before loading (Removed explicit gc.collect/empty_cache)
+                # gc.collect()
                 if self._device.type == "cuda": torch.cuda.empty_cache()
 
                 # Explicitly login using the token before loading pipeline
@@ -406,7 +410,7 @@ class DiarizationService:
 
 
     # Use string forward reference for Annotation type hint
-    def _run_pipeline_on_chunk(self, pipeline, chunk_path: str, params: Dict[str, Any]) -> Optional['Annotation']:
+    def _run_pipeline_on_chunk(self, pipeline, chunk_path: str, params: Dict[str, Any], pipeline_hyperparams: Dict[str, Any]) -> Optional['Annotation']:
         """Runs the pipeline on a single chunk (synchronous wrapper for executor)."""
         chunk_name = os.path.basename(chunk_path)
         chunk_start_time = time.time()
@@ -418,7 +422,10 @@ class DiarizationService:
                  return None
 
             audio_input = chunk_path
-            result: Annotation = pipeline(audio_input, **params) # Result should be Annotation type
+            # Combine speaker count params and pipeline hyperparams
+            all_params = {**params, **pipeline_hyperparams}
+            logger.debug(f"[DIARIZATION] Running pipeline on {chunk_name} with params: {all_params}")
+            result: Annotation = pipeline(audio_input, **all_params) # Result should be Annotation type
             chunk_time = time.time() - chunk_start_time
             logger.debug(f"[DIARIZATION] Chunk processing successful: {chunk_name} -> {len(result.labels())} speakers in {chunk_time:.2f}s")
             return result
@@ -431,10 +438,15 @@ class DiarizationService:
         self,
         file_path: str,
         num_speakers: Optional[int] = None,
-        min_speakers: Optional[int] = None,
+        min_speakers: Optional[int] = None, # Speaker count constraints
         max_speakers: Optional[int] = None,
+        # --- Pyannote Hyperparameters ---
+        segmentation_onset: Optional[float] = None, # e.g., 0.5
+        clustering_threshold: Optional[float] = None, # e.g., 0.5 (depends on model)
+        segmentation_min_duration_off: Optional[float] = None, # e.g., 0.1
+        # --- Other Params ---
         progress_callback: Optional[Callable[[str, float, Dict[str, Any]], None]] = None,
-        language: Optional[str] = None,
+        language: Optional[str] = None, # Language hint (might be used by some pipelines)
         task_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
@@ -477,18 +489,29 @@ class DiarizationService:
                  logger.warning(f"[DIARIZATION][{task_id}] Audio file '{os.path.basename(processed_file_path)}' is too short or has invalid duration ({duration:.2f}s). Skipping diarization.")
                  return []
 
-            # 4. Prepare Diarization Parameters
+            # 4. Prepare Diarization Parameters (Speaker Count & Hyperparameters)
             _update_progress(0.10, "preparing_parameters")
-            params = {}
+            speaker_params = {}
             if num_speakers:
-                params["num_speakers"] = num_speakers
-                min_speakers, max_speakers = None, None
+                speaker_params["num_speakers"] = num_speakers
+                min_speakers, max_speakers = None, None # Override min/max if num_speakers is set
             else:
-                params["min_speakers"] = min_speakers if min_speakers is not None else 1
+                speaker_params["min_speakers"] = min_speakers if min_speakers is not None else 1
+                # Dynamic default max based on duration
                 default_max = 10 if duration > 1800 else (8 if duration > 600 else 6)
                 max_effective = max_speakers if max_speakers is not None else default_max
-                params["max_speakers"] = max(params["min_speakers"], max_effective)
-            logger.info(f"[DIARIZATION][{task_id}] Running diarization for '{os.path.basename(processed_file_path)}' ({duration:.1f}s) with effective params: {params}")
+                speaker_params["max_speakers"] = max(speaker_params["min_speakers"], max_effective)
+
+            # Collect pipeline hyperparameters if provided
+            pipeline_hyperparams = {}
+            if segmentation_onset is not None: pipeline_hyperparams["segmentation_onset"] = segmentation_onset
+            if clustering_threshold is not None: pipeline_hyperparams["clustering_threshold"] = clustering_threshold
+            if segmentation_min_duration_off is not None: pipeline_hyperparams["segmentation_min_duration_off"] = segmentation_min_duration_off
+
+            logger.info(f"[DIARIZATION][{task_id}] Running diarization for '{os.path.basename(processed_file_path)}' ({duration:.1f}s)")
+            logger.info(f"[DIARIZATION][{task_id}] Effective speaker params: {speaker_params}")
+            if pipeline_hyperparams:
+                logger.info(f"[DIARIZATION][{task_id}] Pipeline hyperparameters: {pipeline_hyperparams}")
 
 
             # 5. Execute Diarization (Chunked or Standard)
@@ -515,19 +538,32 @@ class DiarizationService:
                       logger.info(f"Processing {num_chunks} audio chunks...")
 
                       all_chunk_results = []
-                      # Determine max workers based on settings and available CPUs
-                      # Use asyncio.to_thread to run pipeline on chunks concurrently
+                      # Use asyncio.to_thread with semaphore to limit concurrency
                       tasks = []
                       num_chunks = len(chunk_paths)
-                      logger.info(f"Processing {num_chunks} chunks using asyncio.to_thread...")
+                      logger.info(f"Processing {num_chunks} chunks using asyncio.to_thread with concurrency limit {self._chunk_semaphore._value}...")
+
+                      async def process_chunk_wrapper(chunk_path, index):
+                          # Acquire semaphore before running the thread
+                          async with self._chunk_semaphore:
+                              logger.debug(f"Acquired semaphore for chunk {index}")
+                              try:
+                                  # Run the synchronous function in a thread pool
+                                  result = await asyncio.to_thread(
+                                      self._run_pipeline_on_chunk,
+                                      pipeline, # The loaded pipeline object
+                                      chunk_path, # Path to the audio chunk
+                                      speaker_params, # Speaker count constraints
+                                      pipeline_hyperparams # Other pipeline params
+                                  )
+                                  return result
+                              finally:
+                                  # Semaphore is released automatically by 'async with'
+                                  logger.debug(f"Released semaphore for chunk {index}")
+
                       for i, chunk_path in enumerate(chunk_paths):
                           task = asyncio.create_task(
-                              asyncio.to_thread(
-                                  self._run_pipeline_on_chunk,
-                                  pipeline,
-                                  chunk_path,
-                                  params
-                              ),
+                              process_chunk_wrapper(chunk_path, i),
                               name=f"diarize_chunk_{i}"
                           )
                           tasks.append(task)
@@ -550,12 +586,12 @@ class DiarizationService:
             if not needs_chunking:
                  _update_progress(0.15, "processing_audio")
                  logger.info("Audio duration within limit or chunking failed. Using standard diarization processing.")
-                 final_diarization_result = await loop.run_in_executor(None, self._run_pipeline_on_chunk, pipeline, processed_file_path, params)
+                 final_diarization_result = await loop.run_in_executor(None, self._run_pipeline_on_chunk, pipeline, processed_file_path, speaker_params, pipeline_hyperparams)
                  _update_progress(0.95, "processing_complete")
 
             # 6. Format Results
             _update_progress(0.98, "formatting_results")
-            formatted_segments = self._format_results(final_diarization_result, params.get("min_speakers"), params.get("max_speakers"))
+            formatted_segments = self._format_results(final_diarization_result, speaker_params.get("min_speakers"), speaker_params.get("max_speakers"), task_id=task_id)
 
             processing_time = time.time() - start_time
             num_speakers_found = len(set(s['speaker'] for s in formatted_segments))
@@ -581,9 +617,9 @@ class DiarizationService:
                 try: shutil.rmtree(temp_chunk_dir); logger.debug(f"Removed temp chunk dir: {temp_chunk_dir}")
                 except OSError as e: logger.warning(f"Failed to remove temporary chunk directory {temp_chunk_dir}: {e}")
 
-            gc.collect()
-            if self._device.type == 'cuda' and torch and torch.cuda.is_available():
-                 torch.cuda.empty_cache()
+            # gc.collect() # Removed explicit call
+            # if self._device.type == 'cuda' and torch and torch.cuda.is_available():
+            #      torch.cuda.empty_cache() # Removed explicit call
 
     # Use string forward reference for Annotation type hint
     def _merge_diarization_chunks(self, chunk_results: List[Dict], chunk_size: int, overlap: int, task_id: Optional[str] = None) -> Optional['Annotation']:
@@ -630,7 +666,7 @@ class DiarizationService:
 
 
     # Use string forward reference for Annotation type hint
-    def _format_results(self, diarization_result: Optional['Annotation'], min_speakers: Optional[int], max_speakers: Optional[int], task_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def _format_results(self, diarization_result: Optional['Annotation'], min_speakers: Optional[int], max_speakers: Optional[int], task_id: Optional[str] = None, min_segment_duration: float = 0.75) -> List[Dict[str, Any]]:
         """Formats the final pyannote Annotation object into the API response list."""
         if diarization_result is None: return []
         if not DIARIZATION_AVAILABLE: # Check dependencies again before using Annotation
@@ -638,59 +674,114 @@ class DiarizationService:
              return []
 
         formatted = []
+        format_start_time = time.time() # Start timer before formatting
         try:
             if not isinstance(diarization_result, Annotation):
-                 logger.warning(f"[DIARIZATION][{task_id}] Expected Annotation object for formatting, got {type(diarization_result)}. Cannot format.")
-                 return []
+                logger.warning(f"[DIARIZATION][{task_id}] Expected Annotation object for formatting, got {type(diarization_result)}. Cannot format.")
+                return []
 
+            # Initial formatting from Annotation
             for segment, _, speaker in diarization_result.itertracks(yield_label=True):
-                 formatted.append({
-                     "start": round(segment.start, 3),
-                     "end": round(segment.end, 3),
-                     "speaker": str(speaker)
-                 })
+                formatted.append({
+                    "start": round(segment.start, 3),
+                    "end": round(segment.end, 3),
+                    "speaker": str(speaker)
+                })
             formatted.sort(key=lambda x: x['start'])
 
             unique_speakers = sorted(list(set(s['speaker'] for s in formatted)))
             num_detected = len(unique_speakers)
-            format_start_time = time.time()
-            logger.info(f"[DIARIZATION][{task_id}] Initial formatting produced {num_detected} unique speaker labels.")
+            logger.info(f"[DIARIZATION][{task_id}] Initial formatting produced {len(formatted)} segments and {num_detected} unique speaker labels.")
 
-            # Enforce Max Speakers (basic heuristic)
+            # --- Post-processing: Merge short segments ---
+            if formatted and min_segment_duration > 0:
+                merged_short_segments = []
+                i = 0
+                while i < len(formatted):
+                    current_seg = formatted[i]
+                    duration = current_seg['end'] - current_seg['start']
+
+                    if duration < min_segment_duration:
+                        merged = False
+                        # Try merging with previous segment if same speaker
+                        if i > 0 and merged_short_segments:
+                            prev_seg = merged_short_segments[-1]
+                            if prev_seg['speaker'] == current_seg['speaker']:
+                                # Merge current into previous
+                                prev_seg['end'] = current_seg['end']
+                                logger.debug(f"[DIARIZATION][{task_id}] Merged short segment (idx {i}, {duration:.2f}s) into previous.")
+                                merged = True
+
+                        # Try merging with next segment if same speaker (and not already merged with prev)
+                        if not merged and i + 1 < len(formatted):
+                            next_seg = formatted[i+1]
+                            if next_seg['speaker'] == current_seg['speaker']:
+                                # Merge current into next (adjust next's start)
+                                next_seg['start'] = current_seg['start']
+                                # Add the adjusted next segment and skip the original next one in the outer loop
+                                merged_short_segments.append(next_seg)
+                                logger.debug(f"[DIARIZATION][{task_id}] Merged short segment (idx {i}, {duration:.2f}s) into next.")
+                                i += 1 # Skip the next segment as it's now incorporated
+                                merged = True
+
+                        # If it couldn't be merged, keep it (it might be a valid short utterance)
+                        if not merged:
+                            merged_short_segments.append(current_seg)
+                            logger.debug(f"[DIARIZATION][{task_id}] Kept short segment (idx {i}, {duration:.2f}s) as it couldn't be merged.")
+                    else:
+                        # Segment is long enough, keep it
+                        merged_short_segments.append(current_seg)
+
+                    i += 1 # Move to the next segment
+
+                if len(merged_short_segments) < len(formatted):
+                    logger.info(f"[DIARIZATION][{task_id}] Merged {len(formatted) - len(merged_short_segments)} segments shorter than {min_segment_duration}s.")
+                    formatted = merged_short_segments
+                    # Recalculate unique speakers after merging short segments
+                    unique_speakers = sorted(list(set(s['speaker'] for s in formatted)))
+                    num_detected = len(unique_speakers)
+
+
+            # --- Post-processing: Enforce Max Speakers (basic heuristic) ---
             if max_speakers is not None and num_detected > max_speakers:
-                 logger.warning(f"[DIARIZATION][{task_id}] Detected {num_detected} speakers, exceeding max limit {max_speakers}. Applying basic merge heuristic.")
-                 speaker_durations = {spk: 0.0 for spk in unique_speakers}
-                 for seg in formatted:
-                      speaker = seg['speaker']
-                      speaker_durations[speaker] += (seg['end'] - seg['start'])
-                 speakers_sorted_by_duration = sorted(speaker_durations.keys(), key=lambda s: speaker_durations[s], reverse=True)
-                 speakers_to_keep = set(speakers_sorted_by_duration[:max_speakers])
-                 speakers_to_remap = speakers_sorted_by_duration[max_speakers:]
-                 remap_dict = {}
-                 if speakers_to_keep:
+                logger.warning(f"[DIARIZATION][{task_id}] Detected {num_detected} speakers after short segment merge, exceeding max limit {max_speakers}. Applying basic merge heuristic.")
+                speaker_durations = {spk: 0.0 for spk in unique_speakers}
+                for seg in formatted:
+                    speaker = seg['speaker']
+                    speaker_durations[speaker] += (seg['end'] - seg['start'])
+                speakers_sorted_by_duration = sorted(speaker_durations.keys(), key=lambda s: speaker_durations[s], reverse=True)
+                speakers_to_keep = set(speakers_sorted_by_duration[:max_speakers])
+                speakers_to_remap = speakers_sorted_by_duration[max_speakers:]
+                remap_dict = {}
+                if speakers_to_keep:
                     most_dominant_speaker = speakers_sorted_by_duration[0]
                     for spk_remap in speakers_to_remap: remap_dict[spk_remap] = most_dominant_speaker
-                 if remap_dict:
-                     new_formatted = []
-                     for seg in formatted:
-                          original_speaker = seg['speaker']
-                          seg['speaker'] = remap_dict.get(original_speaker, original_speaker)
-                          new_formatted.append(seg)
-                     formatted = new_formatted
-                     final_unique_speakers = sorted(list(set(s['speaker'] for s in formatted)))
-                     logger.info(f"[DIARIZATION][{task_id}] After merging to max {max_speakers} speakers, {len(final_unique_speakers)} unique labels remain.")
+                if remap_dict:
+                    new_formatted = []
+                    for seg in formatted:
+                        original_speaker = seg['speaker']
+                        seg['speaker'] = remap_dict.get(original_speaker, original_speaker)
+                        new_formatted.append(seg)
+                    formatted = new_formatted
+                    final_unique_speakers = sorted(list(set(s['speaker'] for s in formatted)))
+                    logger.info(f"[DIARIZATION][{task_id}] After merging to max {max_speakers} speakers, {len(final_unique_speakers)} unique labels remain.")
+                    # Update num_detected after max speaker enforcement
+                    num_detected = len(final_unique_speakers)
 
-            # Warn if Below Min Speakers
+
+            # --- Post-processing: Warn if Below Min Speakers ---
             if min_speakers is not None and num_detected < min_speakers:
-                 logger.warning(f"[DIARIZATION][{task_id}] Detected only {num_detected} speakers, below the minimum requested/default of {min_speakers}. Results may be less accurate.")
+                logger.warning(f"[DIARIZATION][{task_id}] Detected only {num_detected} speakers after all processing, below the minimum requested/default of {min_speakers}. Results may be less accurate.")
 
         except Exception as e:
-             format_time = time.time() - format_start_time
-             logger.error(f"[DIARIZATION][{task_id}] Error formatting diarization results: {e}", exc_info=True)
-             return []
+            # Ensure format_time is calculated even on error
+            format_time = time.time() - format_start_time
+            logger.error(f"[DIARIZATION][{task_id}] Error during formatting/post-processing diarization results (after {format_time:.2f}s): {e}", exc_info=True)
+            return [] # Return empty list on error
 
+        # Calculate final format time if no error occurred
         format_time = time.time() - format_start_time
-        logger.info(f"[DIARIZATION][{task_id}] Formatting completed in {format_time:.2f}s.")
+        logger.info(f"[DIARIZATION][{task_id}] Formatting and post-processing completed in {format_time:.2f}s.")
         return formatted
 
 

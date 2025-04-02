@@ -14,6 +14,7 @@ A high-performance API for audio transcription with optional speaker diarization
 - **🚀 High-Performance Transcription**: Leverages GPU-accelerated Whisper models via `transformers`.
 - **🇸🇪 Optimized for Swedish**: Easily configure KB-Whisper models (thanks to [KBLab](https://huggingface.co/KBLab)) via `.env` for superior Swedish transcription accuracy.
 - **🔊 Speaker Identification**: Optional speaker diarization using `pyannote.audio` to identify _who_ spoke _when_.
+- **⚙️ Tunable Diarization**: Control segmentation sensitivity and speaker clustering via API parameters (`segmentation_onset`, `clustering_threshold`, `segmentation_min_duration_off`).
 - **🔒 Privacy Focused**:
   - **Automatic File Deletion**: Audio files automatically and securely deleted after processing (configurable).
   - **Secure Storage**: Options for memory-based storage (`tmpfs`) or persistent volumes with secure directory permissions.
@@ -218,3 +219,10 @@ This API is designed with privacy in mind:
 ## 📄 License
 
 This project is licensed under the MIT License. (You should add a LICENSE file with the MIT license text to the repository root).
+
+
+## Additional info
+Decision: We will keep the attn_implementation="flash_attention_2" line commented out in app/models/whisper_model.py for now.
+Recommendation: For users with compatible hardware (Ampere+), they can achieve the performance boost by:
+Installing the extra dependency: uv pip install flash-attn --no-build-isolation
+Uncommenting the line # attn_implementation="flash_attention_2" in app/models/whisper_model.py or potentially making this configurable via an environment variable in the future. This provides the optimization path without breaking compatibility by default.
