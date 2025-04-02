@@ -68,7 +68,7 @@ Visit [KBLab's Whisper models on Hugging Face](https://huggingface.co/KBLab) to 
 1. **Clone Repository**
 
    ```bash
-   git clone https://github.com/CCimen/openai-transcription-api.git
+   git clone https://github.com/CCimen/whisper-api.git
    cd openai-transcription-api
    ```
 
