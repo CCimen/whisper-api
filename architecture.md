@@ -24,10 +24,11 @@ app/
 │   ├── diarization.py        # Speaker diarization service (using pyannote)
 │   ├── model_registry.py     # Manages loading/unloading of transcription models
 │   ├── processor.py          # Orchestrates the audio processing pipeline
-│   ├── task_manager.py       # Handles asynchronous task queuing and execution
-│   └── transcriber.py        # Helper for transcription
+│   └── task_manager.py       # Handles asynchronous task queuing and execution
+├── cli.py                    # Command-line interface script
 ├── config.py                 # Application configuration (settings from .env)
 ├── exceptions.py             # Custom exception classes
+├── logging_config.py         # Logging setup
 └── main.py                   # FastAPI application entry point
 ```
 
@@ -78,6 +79,7 @@ sequenceDiagram
     participant Processor as Audio Processor
     participant ModelReg as Model Registry
     participant WhisperMod as Whisper Model
+    participant DiarizationSvc as Diarization Service
 
     User->>API: POST /transcriptions/ (audio file, params)
     API->>TaskMgr: create_task(type="transcription", params)
@@ -108,7 +110,9 @@ sequenceDiagram
     WhisperMod-->>Processor: Transcription result
     
     opt Diarization Requested
-        Note over Processor: Run Diarization & Assign Speakers
+        Processor->>DiarizationSvc: diarize_file(...)
+        DiarizationSvc-->>Processor: Diarization results (DataFrame)
+        Note over Processor: Assign speakers to segments
     end
     
     Processor->>TaskMgr: Update Status: COMPLETED, Result
@@ -136,8 +140,8 @@ sequenceDiagram
    - Audio is transcribed using the Whisper model
 
 3. **Optional Diarization**:
-   - If requested, speaker recognition is performed
-   - Speakers are assigned to transcription segments
+   - If requested, the `DiarizationService` is called to perform speaker recognition.
+   - The `Processor` then assigns the identified speakers to the transcription segments.
 
 4. **Result Retrieval**:
    - User polls for task status using the task ID
@@ -163,8 +167,8 @@ sequenceDiagram
 * **WhisperModel (`app/models/whisper_model.py`)**: 
   Wraps the Hugging Face implementation of Whisper
 
-* **DiarizationService (`app/services/diarization.py`)**: 
-  Handles speaker diarization using pyannote.audio
+* **DiarizationService (`app/services/diarization.py`)**:
+  Handles speaker diarization using `pyannote.audio` (if dependencies are installed).
 
 * **Configuration (`app/config.py`)**: 
   Loads settings from environment variables using pydantic-settings
@@ -213,41 +217,47 @@ Access interactive documentation at `/docs`
 To add support for a new transcription model:
 
 1. **Implement Model Wrapper**:
-   - Create a new class in `app/models/` inheriting from `TranscriptionModel`
-   - Implement required methods:
+   - Create a new Python file in `app/models/` (e.g., `my_new_model.py`).
+   - Define a class inheriting from `app.services.model_registry.TranscriptionModel`.
+   - Implement the required methods: `load`, `unload`, `is_loaded`, and `transcribe`.
+   - **Crucially**, decorate the class with `@ModelRegistry.register` and ensure the class has a unique `name` attribute (e.g., `name = "my-new-model"`).
      ```python
+     # In app/models/my_new_model.py
+     from app.services.model_registry import TranscriptionModel, ModelRegistry
+
      @ModelRegistry.register
      class MyNewModel(TranscriptionModel):
-         def __init__(self, model_size: str, ...):
+         name = "my-new-model" # Unique name for registration
+
+         def __init__(self, ...): # Add necessary init args
              super().__init__(...)
+             self._loaded = False
+             # ... other initialization ...
              
          def load(self, device: Optional[str] = None):
              # Logic to load model weights
+             # ...
              self._loaded = True
              
          def unload(self):
              # Release resources
+             # ...
              self._loaded = False
              
          def is_loaded(self) -> bool:
              return self._loaded
              
-         def transcribe(self, audio_path: str, ...) -> Dict[str, Any]:
-             # Perform transcription
+         def transcribe(self, audio_path: str, **kwargs) -> Dict[str, Any]:
+             # Perform transcription using your model
+             # ...
              return {"text": "...", "segments": [...]}
      ```
 
-2. **Update Configuration**:
-   ```python
-   # In app/config.py
-   WHISPER_MODEL_MAPPING = {
-       # ... existing models ...
-       "my-custom-model": "huggingface/path-to-your-model",
-   }
-   ```
+2. **Ensure Discovery**:
+   - The `ModelRegistry` automatically discovers models in the `app.models` package when the application starts (specifically, when `ModelRegistry.available_models()` or `get_model()` is first called). Ensure your new file is imported correctly (e.g., via `app/models/__init__.py` if needed, though the decorator often handles this).
 
 3. **Update Documentation**:
-   - Add your new model to the README.md
+   - Add your new model key (e.g., `"my-new-model"`) to the relevant sections of the README.md.
 
 4. **Restart API**:
-   - The application needs to restart to register the new model
+   - The application needs to restart to pick up the new Python file and register the model class during discovery.
