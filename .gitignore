@@ -1,3 +1,4 @@
+whisper-api\.gitignore
 # Python
 __pycache__/
 *.py[cod]
@@ -21,7 +22,7 @@ wheels/
 *.egg
 
 # Model files, cache, uploads, and results
-models/
+# models/  <-- Comment out this line
 uploads/
 results/
 
