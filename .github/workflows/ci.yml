@@ -35,11 +35,19 @@ jobs:
     - name: Verify uv installation
       run: uv --version
 
+    - name: Cache uv venv
+      uses: actions/cache@v4
+      with:
+        path: .venv
+        key: ${{ runner.os }}-uv-${{ hashFiles('**/pyproject.toml', '**/uv.lock') }} # Include lock file if committed
+        restore-keys: |
+          ${{ runner.os }}-uv-
+
     - name: Create virtual environment
       run: uv venv
 
     - name: Install dependencies (including dev extras)
-      run: uv pip install -e ".[all]" # Install project in editable mode with all extras
+      run: uv pip install -e ".[dev,diarization]" # Install project in editable mode with dev and diarization extras
 
     - name: Lint with Ruff
       run: |
