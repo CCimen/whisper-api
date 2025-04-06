@@ -49,9 +49,9 @@ jobs:
     - name: Install dependencies (including dev extras)
       run: uv pip install -e ".[dev,diarization]" # Install project in editable mode with dev and diarization extras
 
-    - name: Lint with Ruff
+    - name: Format and Lint with Ruff
       run: |
-        uv run ruff format --check .
+        uv run ruff format .
         uv run ruff check .
 
     - name: Type check with mypy

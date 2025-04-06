@@ -62,8 +62,6 @@ build-backend = "setuptools.build_meta"
 [tool.ruff]
 # Example Ruff config (optional, adjust as needed)
 line-length = 88
-select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM", "PTH", "RUF"] # Common rules + ruff specific
-ignore = ["B008"] # Ignore function calls as default values if intended
 
 [tool.ruff.lint]
 # Explicitly select rule sets
