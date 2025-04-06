@@ -35,6 +35,9 @@ jobs:
     - name: Verify uv installation
       run: uv --version
 
+    - name: Create virtual environment
+      run: uv venv
+
     - name: Install dependencies (including dev extras)
       run: uv pip install -e ".[all]" # Install project in editable mode with all extras
 
