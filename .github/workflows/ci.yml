@@ -36,7 +36,7 @@ jobs:
       run: uv --version
 
     - name: Install dependencies (including dev extras)
-      run: uv pip sync --all-extras
+      run: uv pip install -e ".[all]" # Install project in editable mode with all extras
 
     - name: Lint with Ruff
       run: |
