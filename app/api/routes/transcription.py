@@ -17,11 +17,12 @@ from pydantic import BaseModel, Field, validator
 # Use the central router registry
 from app.api.router_registry import router_transcription
 from app.config import settings, WHISPER_MODEL_MAPPING
-from app.services.task_manager import task_manager, TaskStatus
+from app.services.task_manager import TaskManager, TaskStatus # Import TaskManager type hint
 from app.exceptions import ConfigurationError, FileProcessingError # For validation/file errors
 
 # Import security dependency
-from app.main import get_api_key # Import from main where it's defined
+from app.main import get_api_key # Keep API key import if needed here
+from app.dependencies import get_task_manager # Import from new location
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -167,7 +168,8 @@ async def _save_upload_file(upload_file: UploadFile) -> str:
 async def submit_transcription_job(
     request_params: TranscriptionRequest = Depends(),
     audio_file: UploadFile = File(..., description="The audio file to transcribe (e.g., mp3, wav, m4a)."),
-    # _: bool = Depends(get_api_key) # Assuming API key dep is handled by router
+    tm: TaskManager = Depends(get_task_manager)
+    # _: bool = Depends(get_api_key) # API key dep is handled by router inclusion in main.py
 ):
     """
     Submit an audio file for asynchronous transcription and optional diarization.
@@ -195,12 +197,14 @@ async def submit_transcription_job(
     finally:
         await audio_file.close()
 
-    if not task_manager:
-         logger.critical("TaskManager not initialized. Cannot create task.")
-         if saved_file_path and os.path.exists(saved_file_path):
-             try: os.remove(saved_file_path)
-             except OSError: pass
-         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Task processing service is unavailable.")
+    # TaskManager is now injected, check should not be needed here, but keep for safety?
+    # Or rely on the dependency raising HTTPException if tm is None. Let's rely on dependency.
+    # if not tm:
+         # logger.critical("TaskManager not initialized. Cannot create task.") # Redundant - handled by dependency
+         # if saved_file_path and os.path.exists(saved_file_path):
+         #     try: os.remove(saved_file_path)
+             # except OSError: pass
+         # raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Task processing service is unavailable.")
 
     # --- Task Creation ---
     try:
@@ -212,16 +216,16 @@ async def submit_transcription_job(
         logger.info(f"Creating transcription task with parameters: {task_params}")
 
         # *** FIX: Call create_task correctly, it returns the generated ID ***
-        task_id = task_manager.create_task(task_type="transcription", params=task_params)
+        task_id = await tm.create_task(task_type="transcription", params=task_params) # Use injected tm and await
         # Now task_id holds the generated UUID
 
         # Add the generated task_id back into params *IF* the processor needs it
         # (optional, depending on processor implementation)
         # task_params["task_id"] = task_id # Add if needed by processor
 
-        await task_manager.queue_task(task_id) # Queue using the generated ID
+        await tm.queue_task(task_id) # Use injected tm
 
-        initial_task_info = task_manager.get_task(task_id, include_result=False)
+        initial_task_info = await tm.get_task(task_id, include_result=False) # Use injected tm and await
         if not initial_task_info:
              raise HTTPException(status_code=500, detail="Failed to retrieve task status after creation.")
 
@@ -259,13 +263,13 @@ async def submit_transcription_job(
     description="Check the current status and progress of a specific transcription job by its ID."
 )
 async def get_transcription_task_status(
-    task_id: str
-    # _: bool = Depends(get_api_key)
+    task_id: str,
+    tm: TaskManager = Depends(get_task_manager)
+    # _: bool = Depends(get_api_key) # API key dep handled by router
 ):
      """Check the current status and progress of a transcription job."""
-     if not task_manager: raise HTTPException(status_code=503, detail="TaskManager unavailable")
-
-     task_info = task_manager.get_task(task_id, include_result=False)
+     # No need to check tm availability, dependency handles it.
+     task_info = await tm.get_task(task_id, include_result=False) # Use injected tm and await
      if not task_info:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Task ID '{task_id}' not found.")
      if task_info.get("type") != "transcription":
@@ -293,15 +297,15 @@ async def get_transcription_task_status(
 )
 async def get_transcription_task_result(
     task_id: str,
-    include_segments: bool = Query(True, description="Set to false to exclude the detailed (potentially large) segments list from the response.")
-    # _: bool = Depends(get_api_key)
+    include_segments: bool = Query(True, description="Set to false to exclude the detailed (potentially large) segments list from the response."),
+    tm: TaskManager = Depends(get_task_manager)
+    # _: bool = Depends(get_api_key) # API key dep handled by router
 ):
     """
     Retrieve the results of a transcription job.
     """
-    if not task_manager: raise HTTPException(status_code=503, detail="TaskManager unavailable")
-
-    task_info = task_manager.get_task(task_id, include_result=True)
+    # No need to check tm availability, dependency handles it.
+    task_info = await tm.get_task(task_id, include_result=True) # Use injected tm and await
     if not task_info:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Task ID '{task_id}' not found.")
     if task_info.get("type") != "transcription":
@@ -332,15 +336,15 @@ async def get_transcription_task_result(
     description="Delete a transcription task record and trigger cleanup of associated temporary files (if not already deleted by auto-cleanup)."
 )
 async def delete_transcription_task(
-    task_id: str
-    # _: bool = Depends(get_api_key)
+    task_id: str,
+    tm: TaskManager = Depends(get_task_manager)
+    # _: bool = Depends(get_api_key) # API key dep handled by router
 ):
     """
     Delete a transcription task record and associated temporary files.
     """
-    if not task_manager: raise HTTPException(status_code=503, detail="TaskManager unavailable")
-
-    deleted = task_manager.delete_task(task_id)
+    # No need to check tm availability, dependency handles it.
+    deleted = await tm.delete_task(task_id) # Use injected tm and await
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Task ID '{task_id}' not found or already deleted.")
 

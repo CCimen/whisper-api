@@ -14,10 +14,11 @@ from app.config import settings, SYSTEM_CAPABILITIES # Use settings and detected
 # Correctly import ModelNotFoundError from app.exceptions
 from app.exceptions import ModelNotFoundError
 from app.services.model_registry import ModelRegistry # Keep ModelRegistry import
-from app.services.task_manager import task_manager
+from app.services.task_manager import TaskManager # Import type hint only
 
 # Import security dependency
-from app.main import get_api_key # Import from main where it's defined
+from app.main import get_api_key # Keep API key import if needed here
+from app.dependencies import get_task_manager, get_model_registry # Import from new location
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -174,13 +175,22 @@ def get_gpu_status() -> GPUStatus:
 async def _load_model_background(model_key: str):
     """Loads a model in the background without blocking the request."""
     # Check if task manager is available before proceeding
-    if not task_manager:
-        logger.error(f"[Background Load Task] TaskManager not available. Cannot load model {model_key}.")
-        return
+    # This background task might need the TaskManager if it interacts with tasks,
+    # but currently it only uses ModelRegistry. If it needed TaskManager,
+    # it would need to be passed in or accessed via app state carefully.
+    # For now, no change needed here regarding task_manager.
+    # if not task_manager: # Original check removed as it wasn't used here
+    # This block should likely check app.state or use a dependency if TaskManager is needed
+    # For now, commenting out the check as it seems unused and caused indentation issues.
+    # logger.error(f"[Background Load Task] TaskManager not available. Cannot load model {model_key}.")
+    # return
+    # If the check above *is* needed, it must be implemented using dependency injection or app.state
+    # and the following lines should be indented under the function definition.
 
     logger.info(f"[Background Load Task] Starting load for {model_key}")
     try:
-        model = ModelRegistry.get_model(model_key) # Instantiates if needed
+        # TODO: Access ModelRegistry via dependency injection or app.state if needed consistently
+        model = ModelRegistry.get_model(model_key) # Assuming static access is okay here for now
         if not model.is_loaded():
             device = "cuda" if settings.USE_CUDA and torch and torch.cuda.is_available() else "cpu"
             # Run load within the task manager's executor if available?
@@ -204,7 +214,9 @@ async def _load_model_background(model_key: str):
 )
 async def get_system_status(
     # API Key Dependency applied at the router level in main.py
-    # _: bool = Depends(get_api_key) # Keep if applying per-route
+    tm: TaskManager = Depends(get_task_manager),
+    mr: ModelRegistry = Depends(get_model_registry)
+    # _: bool = Depends(get_api_key) # API key dep handled by router
 ):
     """
     Get the overall status of the API, including hardware and configuration.
@@ -215,12 +227,11 @@ async def get_system_status(
         dependencies_available=DIARIZATION_AVAILABLE,
         huggingface_token_set=bool(settings.HUGGINGFACE_TOKEN)
     )
-    # Check if task_manager is initialized before calling
-    q_stat_dict = task_manager.get_queue_status() if task_manager else {
-        "queued_tasks": 0, "active_tasks": 0, "max_concurrent_tasks": settings.MAX_CONCURRENT_TASKS, "is_processing": False
-    }
-    q_stat = QueueStatus(**q_stat_dict) # Unpack dict into model
-    model_stat = ModelRegistry.get_model_info() # Returns dict directly
+    # Use injected TaskManager
+    q_stat_dict = tm.get_queue_status() # Dependency ensures tm is not None
+    q_stat = QueueStatus(**q_stat_dict)
+    # Use injected ModelRegistry
+    model_stat = mr.get_model_info()
 
     return SystemStatusResponse(
         gpu_status=gpu_stat,
@@ -253,13 +264,14 @@ async def get_gpu_details(
     description="Lists all transcription models configured in the system and their current load status."
 )
 async def list_available_models(
-    # _: bool = Depends(get_api_key)
+    mr: ModelRegistry = Depends(get_model_registry)
+    # _: bool = Depends(get_api_key) # API key dep handled by router
 ):
     """
     List all available transcription models and their current status.
     """
     try:
-        return ModelRegistry.get_model_info()
+        return mr.get_model_info() # Use injected ModelRegistry
     except Exception as e:
         logger.error(f"Failed to get model info: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to retrieve model information.")
@@ -272,19 +284,20 @@ async def list_available_models(
     description="Requests the server to load a specified model into memory asynchronously. Check status later."
 )
 async def load_model_on_demand(
-    model_name: str
-    # _: bool = Depends(get_api_key)
+    model_name: str,
+    mr: ModelRegistry = Depends(get_model_registry)
+    # _: bool = Depends(get_api_key) # API key dep handled by router
 ):
     """
     Request the server to load a specific model into memory. (Asynchronous)
     """
-    available_models = ModelRegistry.available_models()
+    available_models = mr.available_models() # Use injected ModelRegistry
     if model_name not in available_models:
          raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model '{model_name}' not available. Available: {available_models}")
 
     try:
          # Get model instance (this might instantiate it but not load it)
-         model = ModelRegistry.get_model(model_name)
+         model = mr.get_model(model_name) # Use injected ModelRegistry
          if model.is_loaded():
               logger.info(f"Model '{model_name}' is already loaded.")
               return {"message": f"Model '{model_name}' is already loaded."}
@@ -308,14 +321,15 @@ async def load_model_on_demand(
     description="Requests the server to unload a specific model from memory to free resources."
 )
 async def unload_model_on_demand(
-    model_name: str
-    # _: bool = Depends(get_api_key)
+    model_name: str,
+    mr: ModelRegistry = Depends(get_model_registry)
+    # _: bool = Depends(get_api_key) # API key dep handled by router
 ):
     """
     Request the server to unload a specific model from memory.
     """
     # Check if the model *could* exist, even if not instantiated/loaded
-    available_models = ModelRegistry.available_models()
+    available_models = mr.available_models() # Use injected ModelRegistry
     if model_name not in available_models:
          raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model '{model_name}' is not recognized by the registry.")
 
@@ -323,7 +337,7 @@ async def unload_model_on_demand(
         # Check internal instance dict directly to see if it's even instantiated
         # Use ModelRegistry method if available, otherwise access _instances (less ideal)
         # Ensure ModelRegistry._instances is accessible or provide a method
-        instance = ModelRegistry._instances.get(model_name) # Assuming direct access for check
+        instance = mr._instances.get(model_name) # Use injected ModelRegistry (assuming direct access needed)
         if not instance or not instance.is_loaded():
              logger.info(f"Model '{model_name}' is not currently loaded.")
              return {"message": f"Model '{model_name}' is not currently loaded."}
@@ -334,9 +348,9 @@ async def unload_model_on_demand(
 
         # Verify unload and remove from instances dict (still need lock if multithreaded access to _instances)
         # For simplicity here, we assume unload worked and remove. Registry should handle internally if possible.
-        if model_name in ModelRegistry._instances:
+        if model_name in mr._instances: # Use injected ModelRegistry
             # Ideally, ModelRegistry would have an unload_instance method
-             del ModelRegistry._instances[model_name]
+             del mr._instances[model_name] # Use injected ModelRegistry
 
         logger.info(f"Model '{model_name}' successfully unloaded.")
         return {"message": f"Model '{model_name}' successfully unloaded."}
@@ -353,12 +367,12 @@ async def unload_model_on_demand(
     description="Retrieves the current status of the task processing queue, including active and pending tasks."
 )
 async def get_task_queue_status(
-    # _: bool = Depends(get_api_key)
+    tm: TaskManager = Depends(get_task_manager)
+    # _: bool = Depends(get_api_key) # API key dep handled by router
 ):
     """
     Get the current status of the task processing queue.
     """
-    if not task_manager:
-         raise HTTPException(status_code=503, detail="TaskManager is not available.")
-    q_status_dict = task_manager.get_queue_status()
+    # No need to check tm availability, dependency handles it.
+    q_status_dict = tm.get_queue_status() # Use injected tm
     return QueueStatus(**q_status_dict)

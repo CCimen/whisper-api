@@ -8,6 +8,7 @@ exception handling, and includes API routers.
 import os
 import asyncio
 import logging
+import redis.asyncio as redis # For Redis connection pool
 # import json # No longer needed for JSON logging here
 # from logging.handlers import RotatingFileHandler # Already imported for audit, but good practice
 from rich.logging import RichHandler
@@ -146,17 +147,19 @@ except ImportError as e:
     exit(1)
 
 # Import settings and dependencies safely within a try/except
-task_manager = None  # Initialize to None
+# Global instances will be stored in app.state instead
+# task_manager = None
+# model_registry = None
 try:
     from app.config import settings, WHISPER_MODEL_MAPPING
     # Exit if settings failed to load in config.py
     if settings is None:
         raise ConfigurationError("Settings object failed to initialize in config.py")
 
-    # Instantiate TaskManager only *after* settings are loaded
-    from app.services.task_manager import TaskManager
-    task_manager = TaskManager()  # Now create the instance
+    # Core services will be initialized within the lifespan function now
     from app.services.model_registry import ModelRegistry
+    from app.services.task_manager import TaskManager
+    from app.services.diarization import DiarizationService, DIARIZATION_AVAILABLE # Import DiarizationService
 
 except ImportError as e:
     print(f"[bold red]CRITICAL:[/bold red] Failed to import core modules: {e}. Please ensure all dependencies are installed and configuration is present.")
@@ -165,36 +168,30 @@ except ConfigurationError as e:
     print(f"[bold red]CRITICAL:[/bold red] Configuration Error on startup: {e}")
     exit(1)
 except Exception as e:
-    print(f"[bold red]CRITICAL:[/bold red] Unexpected error during initial imports or TaskManager creation: {e}")
+    print(f"[bold red]CRITICAL:[/bold red] Unexpected error during initial imports: {e}")
     exit(1)
 
 # --- Audit Logging Setup (Remains here as it needs settings) ---
 # (Audit logging code remains unchanged)
 
 # --- Audit Logging Setup ---
+# --- Audit Logging Setup (Moved inside lifespan for app context if needed, or keep global if simple) ---
+# Simplified global setup for audit logger if enabled
 audit_logger = None
 if settings.AUDIT_LOGGING_ENABLED:
     try:
         audit_logger = logging.getLogger("audit")
-        audit_logger.setLevel(logging.INFO)
-        audit_logger.propagate = False
+        # Basic configuration check - detailed setup might need app context if complex
+        if not settings.AUDIT_LOG_PATH:
+             raise ConfigurationError("AUDIT_LOGGING_ENABLED is true, but AUDIT_LOG_PATH is not set.")
+        # Ensure directory exists (permissions handled in config.py)
         log_dir = os.path.dirname(settings.AUDIT_LOG_PATH)
-        if log_dir: 
-            os.makedirs(log_dir, mode=0o700, exist_ok=True)
-        from logging.handlers import RotatingFileHandler
-        handler = RotatingFileHandler(
-            settings.AUDIT_LOG_PATH,
-            maxBytes=5*1024*1024,
-            backupCount=3,
-            encoding='utf-8'
-        )
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - R_ID:%(request_id)s - IP:%(client_ip)s - %(message)s')
-        handler.setFormatter(formatter)
-        audit_logger.addHandler(handler)
-        logger.info(f":lock: Audit logging [config.enabled]enabled[/config.enabled]. Log file: [italic]{settings.AUDIT_LOG_PATH}[/italic]")
+        if log_dir: os.makedirs(log_dir, exist_ok=True)
+        # Handler setup will happen in lifespan or via logging config file
+        # logger.info(f":lock: Audit logging configured in settings. Path: [italic]{settings.AUDIT_LOG_PATH}[/italic]") # Reduced verbosity
     except Exception as e:
-        logger.error(f":warning: [danger]Failed to configure audit logging[/danger] to {settings.AUDIT_LOG_PATH}: {e}")
-        audit_logger = None
+        logger.error(f":warning: [danger]Initial check for audit logging failed:[/danger] {e}")
+        audit_logger = None # Ensure it's None if setup fails
 
 # --- PyTorch & GPU Availability Check ---
 pytorch_available = False
@@ -202,40 +199,25 @@ gpu_available = False
 try:
     import torch
     pytorch_available = True
-    logger.info(f":package: PyTorch version: [config.value]{torch.__version__}[/config.value]")
+    # logger.info(f":package: PyTorch version: [config.value]{torch.__version__}[/config.value]") # Reduced verbosity
     if settings.USE_CUDA:
         if torch.cuda.is_available():
             gpu_available = True
             num_devices = torch.cuda.device_count()
-            logger.info(f":zap: [success]CUDA available[/success]. Found [config.value]{num_devices}[/config.value] device(s).")
-            try:
-                # Validate index before getting name
-                if settings.CUDA_DEVICE < num_devices:
-                    device_name = torch.cuda.get_device_name(settings.CUDA_DEVICE)
-                    logger.info(f":computer: Using CUDA device [config.value]{settings.CUDA_DEVICE}[/config.value]: [model.name]{device_name}[/model.name]")
-                else:
-                    logger.error(f":warning: [danger]Invalid CUDA_DEVICE index {settings.CUDA_DEVICE}[/danger] (found {num_devices}). Check config.")
-                    # Update runtime setting if invalid but devices exist
-                    if num_devices > 0:
-                        logger.warning(f":wrench: Defaulting to CUDA device 0 for runtime.")
-                        # Correct the potentially invalid setting for internal use
-                        settings.CUDA_DEVICE = 0
-                    else:
-                        # If count is 0 but is_available was true, something is wrong
-                        gpu_available = False
-                        settings.USE_CUDA = False
-                        logger.error(":x: [danger]CUDA reported available but no devices found![/danger] Forcing CPU mode.")
-            except Exception as e:
-                logger.error(f":x: [danger]Could not get properties for CUDA device {settings.CUDA_DEVICE}:[/danger] {e}")
+            # logger.info(f":zap: [success]CUDA available[/success]. Found [config.value]{num_devices}[/config.value] device(s).") # Reduced verbosity
+            if settings.CUDA_DEVICE >= num_devices:
+                 logger.error(f":warning: [danger]Invalid CUDA_DEVICE index {settings.CUDA_DEVICE}[/danger] (found {num_devices}). Defaulting to 0.")
+                 settings.CUDA_DEVICE = 0 # Correct setting
+            # logger.info(f":computer: Using CUDA device [config.value]{settings.CUDA_DEVICE}[/config.value]") # Reduced verbosity
         else:
-            logger.warning(":warning: CUDA is enabled in settings, but [italic]torch.cuda.is_available()[/italic] is [config.disabled]False[/config.disabled]. Check PyTorch installation and drivers. API will use CPU.")
-            settings.USE_CUDA = False  # Correct setting if CUDA unavailable
-    else:
-        logger.info(":information_source: CUDA is disabled in settings. API will use CPU.")
+            # logger.warning(":warning: CUDA enabled but not available. Check drivers/installation. Using CPU.") # Reduced verbosity
+            settings.USE_CUDA = False # Correct setting
+    # else: # Reduced verbosity
+        # logger.info(":information_source: CUDA is disabled in settings. Using CPU.")
 
 except ImportError:
     logger.warning(":warning: [warning]PyTorch not found[/warning]. Transcription/Diarization will likely fail.")
-    torch = None
+    torch = None # Keep torch=None check available
 
 
 # --- API Key Security ---
@@ -324,7 +306,7 @@ async def run_periodic_cleanup():
             await asyncio.sleep(interval_seconds)
             logger.debug("🧹 Running periodic cleanup cycle...")
 
-            cleaned_tasks = task_manager.cleanup_old_tasks()
+            cleaned_tasks = await task_manager.cleanup_old_tasks()
             if cleaned_tasks > 0:
                 # Create a small table for cleanup results
                 table = Table(
@@ -365,46 +347,137 @@ async def lifespan(app: FastAPI):
     start_time = time.time()
     # Logging is now handled by Uvicorn's --log-config, setup happens before lifespan
 
+    # --- Initialize Redis Pool ---
+    redis_pool = None
+    if settings.REDIS_HOST:
+        try:
+            logger.info(f":globe_with_meridians: Attempting to connect to Redis at [config.value]{settings.REDIS_HOST}:{settings.REDIS_PORT}[/config.value] (DB: {settings.REDIS_DB})")
+            redis_pool = redis.ConnectionPool(
+                host=settings.REDIS_HOST,
+                port=settings.REDIS_PORT,
+                db=settings.REDIS_DB,
+                password=settings.REDIS_PASSWORD,
+                socket_timeout=settings.REDIS_TIMEOUT,
+                decode_responses=True # Decode responses to strings
+            )
+            # Test connection
+            r = redis.Redis(connection_pool=redis_pool)
+            await r.ping()
+            app.state.redis_pool = redis_pool # Store pool in app state
+            logger.info(":white_check_mark: [success]Successfully connected to Redis.[/success]")
+        except Exception as e:
+            logger.error(f":x: [danger]Failed to connect to Redis:[/danger] {e}. Task management and session storage may fail.")
+            app.state.redis_pool = None # Ensure it's None if connection failed
+            redis_pool = None # Ensure local variable is also None
+    else:
+        logger.warning(":warning: [warning]REDIS_HOST not configured.[/warning] Task management features requiring Redis will not work.")
+        app.state.redis_pool = None
+
+    # --- Instantiate DiarizationService (if enabled and available) ---
+    # Moved BEFORE TaskManager initialization
+    app.state.diarization_service = None # Initialize in state first
+    if settings.DIARIZATION_ENABLED and DIARIZATION_AVAILABLE:
+        try:
+            app.state.diarization_service = DiarizationService()
+            logger.info(":loud_sound: DiarizationService initialized and stored in app.state.")
+        except Exception as e:
+            logger.error(f":warning: [danger]Failed to initialize DiarizationService during startup:[/danger] {e}", exc_info=True)
+            # App can continue, but diarization routes/features might fail later
+    elif settings.DIARIZATION_ENABLED:
+         logger.warning(":warning: Diarization enabled in settings, but dependencies are missing. DiarizationService not initialized.")
+
+    # --- Instantiate TaskManager (Now depends on Redis pool AND DiarizationService) ---
+    # global task_manager # No longer using module global
+    try:
+        # Import moved inside lifespan to ensure config is loaded
+        from app.services.task_manager import TaskManager
+        # Pass the potentially None redis_pool and diarization_service to TaskManager
+        # Instantiate and store in app.state
+        app.state.task_manager = TaskManager(
+            redis_pool=app.state.redis_pool,
+            diarization_service=app.state.diarization_service # Pass the potentially None diarization service instance
+        )
+        # logger.info(":gear: TaskManager initialized and stored in app.state.") # Reduced verbosity
+    except Exception as e:
+        logger.critical(f":rotating_light: [danger]CRITICAL: Failed to initialize TaskManager:[/danger] {e}", exc_info=True)
+        # Decide if the app should exit if TaskManager is critical
+        # sys.exit(1) # Uncomment to make TaskManager essential
+
+    # --- Instantiate ModelRegistry ---
+    # global model_registry # No longer using module global
+    try:
+        # Instantiate and store in app.state
+        app.state.model_registry = ModelRegistry()
+        # logger.info(":books: ModelRegistry initialized and stored in app.state.") # Reduced verbosity
+    except Exception as e:
+        logger.critical(f":rotating_light: [danger]CRITICAL: Failed to initialize ModelRegistry:[/danger] {e}", exc_info=True)
+        # sys.exit(1) # Uncomment if ModelRegistry is essential
+
     # --- Continue with Startup ---
-    app_title = Text(f"--- Starting {settings.APP_NAME} v{settings.APP_VERSION} ---")
-    app_title.stylize("bold magenta")
-    logger.info(app_title)
+    # --- Continue with Startup ---
+    # app_title = Text(f"--- Starting {settings.APP_NAME} v{settings.APP_VERSION} ---") # Reduced verbosity
+    # app_title.stylize("bold magenta")
+    # logger.info(app_title)
     
     # Log critical settings resolved after loading .env
-    logger.info(Panel.fit(
-        f"[config.key]API Authentication Required:[/config.key] [config.value]{settings.API_AUTH_REQUIRED}[/config.value]\n"
-        f"[config.key]Diarization Enabled:[/config.key] [config.value]{settings.DIARIZATION_ENABLED}[/config.value]\n"
-        f"[config.key]Max Concurrent Tasks:[/config.key] [config.value]{settings.MAX_CONCURRENT_TASKS}[/config.value]\n"
-        f"[config.key]Default Model:[/config.key] [config.value]{settings.DEFAULT_MODEL}[/config.value]\n"
-        f"[config.key]Using CUDA:[/config.key] [config.value]{settings.USE_CUDA}[/config.value] | [config.key]GPU Available:[/config.key] [config.value]{gpu_available}[/config.value]",
-        title="[app.title]Configuration[/app.title]",
-        border_style="cyan"
-    ))
+    # logger.info(Panel.fit( # Commented out to reduce duplicate logs from multiple workers
+    #     f"[config.key]API Authentication Required:[/config.key] [config.value]{settings.API_AUTH_REQUIRED}[/config.value]\n"
+    #     f"[config.key]Diarization Enabled:[/config.key] [config.value]{settings.DIARIZATION_ENABLED}[/config.value]\n"
+    #     f"[config.key]Max Concurrent Tasks:[/config.key] [config.value]{settings.MAX_CONCURRENT_TASKS}[/config.value]\n"
+    #     f"[config.key]Default Model:[/config.key] [config.value]{settings.DEFAULT_MODEL}[/config.value]\n"
+    #     f"[config.key]Using CUDA:[/config.key] [config.value]{settings.USE_CUDA}[/config.value] | [config.key]GPU Available:[/config.key] [config.value]{gpu_available}[/config.value]",
+    #     title="[app.title]Configuration[/app.title]",
+    #     border_style="cyan"
+    # ))
 
     # Ensure ModelRegistry discovers models early
+    # Ensure ModelRegistry discovers models early (using the instance)
     try:
-        ModelRegistry.discover_models()
-        available_models = ModelRegistry.available_models()
-        logger.info(f":mag: Available models discovered: [model.name]{', '.join(available_models)}[/model.name]")
+        # Use instance from app.state
+        app.state.model_registry.discover_models()
+        available_models = app.state.model_registry.available_models()
+        # logger.info(f":mag: Available models discovered: [model.name]{', '.join(available_models)}[/model.name]") # Reduced verbosity
     except Exception as e:
-        logger.error(f":x: [danger]Failed during model discovery:[/danger] {e}")
+        logger.error(f":x: [danger]Failed during model discovery:[/danger] {e}", exc_info=True) # Add exc_info
 
     # Preload default model if configured
     preload_task = None
     if settings.PRELOAD_DEFAULT_MODEL and settings.DEFAULT_MODEL:
         model_key = f"whisper-{settings.DEFAULT_MODEL}"
-        if model_key in ModelRegistry.available_models():
-            logger.info(f":hourglass: Initiating preload for default model: [model.name]{model_key}[/model.name]...")
+        # Use instance from app.state
+        if model_key in app.state.model_registry.available_models():
+            # logger.info(f":hourglass: Initiating preload for default model: [model.name]{model_key}[/model.name]...") # Reduced verbosity
+            logger.info(f":hourglass: Initiating preload for default model: [model.name]{model_key}[/model.name]...") # Keep preload initiation log
             preload_task = asyncio.create_task(preload_model_background(model_key))
         else:
-            logger.warning(f":warning: Default model '[model.name]{settings.DEFAULT_MODEL}[/model.name]' (key: [model.name]{model_key}[/model.name]) specified for preload but [warning]not found in registry[/warning]. Available: [model.name]{', '.join(ModelRegistry.available_models())}[/model.name]")
+            # Use instance from app.state
+            logger.warning(f":warning: Default model '[model.name]{settings.DEFAULT_MODEL}[/model.name]' (key: [model.name]{model_key}[/model.name]) specified for preload but [warning]not found in registry[/warning]. Available: [model.name]{', '.join(app.state.model_registry.available_models())}[/model.name]")
 
     # Start periodic cleanup task
+    # logger.info("🧹 Starting periodic cleanup task...") # Reduced verbosity (run_periodic_cleanup logs its own start)
     cleanup_task = asyncio.create_task(run_periodic_cleanup())
 
-    # Uvicorn handles its own startup complete message when using --log-config
-    # We can log specific app-level readiness if needed, but the basic message is covered.
-    # logger.info("Application components initialized.") # Example
+    # --- Log Final Configuration Summary (after settings and services are loaded) ---
+    logger.info("--- Application Startup Configuration ---")
+    # Use f-strings and access settings directly
+    cuda_status = f"[success]Enabled[/success] (Device: {settings.CUDA_DEVICE})" if settings.USE_CUDA and gpu_available else "[warning]Disabled or Unavailable[/warning]"
+    diar_status = f"[success]Enabled[/success]" if settings.DIARIZATION_ENABLED and DIARIZATION_AVAILABLE else "[warning]Disabled or Unavailable[/warning]"
+    auth_status = f"[success]Enabled[/success]" if settings.API_AUTH_REQUIRED else "[danger]DISABLED[/danger]"
+    redis_status = "[success]Connected[/success]" if app.state.redis_pool else "[danger]Not Connected[/danger]"
+
+    # Create a simple summary string or use Rich Panel if preferred
+    summary_text = (
+        f"  Default Model: [config.value]{settings.DEFAULT_MODEL}[/config.value]\n"
+        f"  Use CUDA: {cuda_status}\n"
+        f"  Max Concurrent Tasks: [config.value]{settings.MAX_CONCURRENT_TASKS}[/config.value]\n"
+        f"  Diarization: {diar_status}\n"
+        f"  API Auth: {auth_status}\n"
+        f"  Redis Status: {redis_status}\n"
+        f"  Upload Dir: [file.path]{settings.UPLOAD_DIR}[/file.path]\n"
+        f"  Results Dir: [file.path]{settings.RESULTS_DIR}[/file.path]"
+    )
+    logger.info(Panel(summary_text, title="[app.title]Key Settings[/app.title]", border_style="cyan", expand=False))
+    logger.info("--- Application Startup Complete ---")
 
     yield  # Application runs here
 
@@ -415,9 +488,10 @@ async def lifespan(app: FastAPI):
     shutdown_start_time = time.time()
 
     # 1. Signal TaskManager to shut down
-    if task_manager:
+    # Use instance from app.state
+    if hasattr(app.state, 'task_manager') and app.state.task_manager:
         logger.info(":gear: Initiating TaskManager shutdown...")
-        await task_manager.shutdown()
+        await app.state.task_manager.shutdown()
         logger.info(":white_check_mark: TaskManager shutdown complete.")
     else:
         logger.warning(":warning: [warning]TaskManager not available during shutdown sequence.[/warning]")
@@ -437,13 +511,25 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f":x: [danger]Error waiting for cleanup task during shutdown:[/danger] {e}")
 
-    # 3. Unload all models
+    # 3. Close Redis Pool
+    if hasattr(app.state, 'redis_pool') and app.state.redis_pool:
+        logger.info(":electric_plug: Closing Redis connection pool...")
+        try:
+            # Use disconnect() which closes all connections in the pool
+            await app.state.redis_pool.disconnect(inuse_connections=True)
+            logger.info(":white_check_mark: Redis connection pool closed.")
+        except Exception as e:
+            logger.error(f":x: [danger]Error closing Redis pool:[/danger] {e}")
+
+    # 4. Unload all models
+    # Use instance from app.state
     try:
-        ModelRegistry.unload_all()
+        if hasattr(app.state, 'model_registry') and app.state.model_registry:
+            app.state.model_registry.unload_all()
     except Exception as e:
         logger.error(f":x: [danger]Error unloading models during shutdown:[/danger] {e}")
 
-    # 4. Final memory cleanup
+    # 5. Final memory cleanup
     gc.collect()
     if gpu_available and torch:
         try:
@@ -667,3 +753,4 @@ app.add_route("/metrics", handle_metrics)
 async def read_root():
     """Redirects root path to API documentation."""
     return RedirectResponse(url="/docs")
+# --- Dependency functions moved to app/dependencies.py to avoid circular imports ---

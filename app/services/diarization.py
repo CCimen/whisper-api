@@ -785,12 +785,5 @@ class DiarizationService:
         return formatted
 
 
-# --- Create Global Service Instance ---
-diarization_service: Optional[DiarizationService] = None
-if settings and settings.DIARIZATION_ENABLED and DIARIZATION_AVAILABLE:
-    try:
-        diarization_service = DiarizationService()
-    except Exception as e:
-        logger.error(f"Failed to initialize DiarizationService during global creation: {e}", exc_info=True)
-elif settings and settings.DIARIZATION_ENABLED:
-     logger.warning("Diarization enabled in settings, but service could not be initialized (likely missing dependencies).")
+# --- Global Service Instance (Removed - Initialization moved to main.py lifespan) ---
+# diarization_service: Optional[DiarizationService] = None # Instance is now created in main.py

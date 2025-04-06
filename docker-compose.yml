@@ -27,6 +27,7 @@ services:
       # Pass the token as the standard HF Hub environment variable
       - HUGGING_FACE_HUB_TOKEN=${HUGGINGFACE_TOKEN}
       # HF_HOME is set in Dockerfile, no need to repeat unless overriding
+      - REDIS_HOST=redis # Point to the Redis service name
     deploy:
       resources:
         reservations:
@@ -35,6 +36,9 @@ services:
               count: 1
               capabilities: [gpu]
     restart: unless-stopped
+    depends_on: # Add dependency on Redis
+      redis:
+        condition: service_healthy # Wait for Redis to be healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health/"]
       interval: 30s
@@ -70,7 +74,11 @@ services:
       - MODELS_CACHE_DIR=/home/appuser/.cache/huggingface/hub
       - AUDIT_LOG_PATH=/app/logs/audit.log
       # HF_HOME set in Dockerfile
+      - REDIS_HOST=redis # Point to the Redis service name for dev
     restart: unless-stopped
+    depends_on: # Add dependency on Redis for dev service too
+      redis:
+        condition: service_healthy
     develop:
       watch:
         - action: sync
@@ -82,9 +90,25 @@ services:
         - action: rebuild
           path: pyproject.toml
 
+  redis: # Add Redis service definition
+    image: redis:7-alpine # Use official Redis Alpine image
+    container_name: whisper-redis
+    hostname: redis
+    restart: always
+    ports:
+      - "6379:6379" # Expose port if needed externally (optional)
+    volumes:
+      - whisper_redis_data:/data # Persist Redis data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   # Renamed volume for clarity
   whisper_hf_cache:
   whisper_uploads:
   whisper_results:
   whisper_logs:
+  whisper_redis_data: # Define volume for Redis data

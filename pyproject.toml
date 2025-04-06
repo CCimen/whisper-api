@@ -30,6 +30,7 @@ dependencies = [
     # tabulate removed as it wasn't used
     "starlette-exporter>=0.20.0,<0.22.0", # For Prometheus metrics
     "slowapi>=0.1.9,<0.2.0", # For rate limiting
+    "redis[hiredis]>=5.0.0,<6.0.0", # For task queue and state management
 ]
 
 [project.optional-dependencies]

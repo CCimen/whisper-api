@@ -8,11 +8,14 @@
 [![Transformers](https://img.shields.io/badge/Transformers-4.35+-ff69b4?logo=huggingface&logoColor=white)](https://huggingface.co/transformers)
 [![Docker Support](https://img.shields.io/badge/Docker-Supported-blue?logo=docker&logoColor=white)](https://www.docker.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Redis](https://img.shields.io/badge/Redis-Required-red?logo=redis&logoColor=white)](https://redis.io/)
+[![CI](https://github.com/CCimen/whisper-api/actions/workflows/ci.yml/badge.svg)](https://github.com/CCimen/whisper-api/actions/workflows/ci.yml)
+[![Docker Release](https://github.com/CCimen/whisper-api/actions/workflows/release.yml/badge.svg)](https://github.com/CCimen/whisper-api/actions/workflows/release.yml)
 
 </div>
 
 <p align="center">
-  A high-performance API for audio transcription with optional speaker diarization, built with FastAPI and optimized for GPU acceleration and privacy.
+  A high-performance API for audio transcription with optional speaker diarization, built with FastAPI, Redis, and optimized for GPU acceleration and privacy. Supports multi-worker scaling.
 </p>
 
 <div align="center">
@@ -31,7 +34,7 @@
 ### 🚀 Performance
 * GPU-accelerated Whisper models via `transformers`.
 * Flash Attention 2 support for compatible GPUs.
-* Asynchronous & scalable with FastAPI and `asyncio`.
+* Asynchronous & scalable with FastAPI, `asyncio`, and Redis for multi-worker task management.
 
 ### 🔊 Audio Processing
 * Speaker identification (diarization) with `pyannote.audio`.
@@ -69,7 +72,7 @@ Visit [KBLab's Whisper models on Hugging Face](https://huggingface.co/KBLab/kb-w
 ### Using Docker (Recommended)
 
 <details>
-<summary><b>View Docker setup instructions</b></summary>
+<summary><b>View Docker setup instructions (Build from source or use pre-built images)</b></summary>
 
 1.  **Clone Repository:**
     ```bash
@@ -93,7 +96,7 @@ Visit [KBLab's Whisper models on Hugging Face](https://huggingface.co/KBLab/kb-w
         * `DEFAULT_MODEL`: Choose a model (e.g., `kblab-large`, `openai-large-v3-turbo`).
         * `AUTO_DELETE_AFTER_COMPLETION=true`: Enhances privacy by deleting files post-processing.
 
-3.  **Build & Run:**
+3.  **Option A: Build & Run from Source:**
     * **GPU Version:**
         ```bash
         docker compose build whisper-api
@@ -106,7 +109,79 @@ Visit [KBLab's Whisper models on Hugging Face](https://huggingface.co/KBLab/kb-w
         docker compose up -d whisper-api
         ```
 
-4.  **Access API:**
+4.  **Option B: Use Pre-built Images (Recommended for faster setup):**
+    * Pre-built images for CPU and GPU are available on GitHub Container Registry (GHCR).
+    * Modify your `docker-compose.yml` to use the `image:` key instead of `build:`.
+    * **Example `docker-compose.yml` snippet (GPU):** (Ensure you have a `redis` service defined as well)
+        ```yaml
+        services:
+          redis:
+            image: redis:7-alpine
+            container_name: whisper-redis
+            command: redis-server --save "" --appendonly no # Basic config, adjust as needed
+            ports:
+              - "6379:6379" # Expose if needed externally, otherwise remove
+            volumes:
+              - redis_data:/data # Optional persistence
+            restart: unless-stopped
+
+          whisper-api:
+            # build:  # Comment out or remove the build section
+            #   context: .
+            #   dockerfile: Dockerfile
+            image: ghcr.io/ccimen/whisper-api:latest-gpu # Or specify a version tag like v1.1.0-gpu
+            container_name: whisper-api-prod
+            env_file:
+              - .env
+            ports:
+              - "${PORT:-8000}:8000"
+            depends_on: # Ensure Redis starts first
+              - redis
+            # ... rest of the service definition (volumes, deploy, etc.)
+
+        volumes: # Define the volume if using persistence for Redis
+          redis_data:
+        ```
+    * **Example `docker-compose.yml` snippet (CPU):**
+        ```yaml
+        services:
+          redis: # Add Redis service here too if running CPU version standalone
+            image: redis:7-alpine
+            container_name: whisper-redis-cpu # Use different name if running both
+            command: redis-server --save "" --appendonly no
+            ports:
+              - "6380:6379" # Use different host port if running both
+            volumes:
+              - redis_data_cpu:/data
+            restart: unless-stopped
+
+          whisper-api-cpu: # Consider a separate service name for clarity
+            image: ghcr.io/ccimen/whisper-api:latest-cpu # Or specify a version tag like v1.1.0-cpu
+            container_name: whisper-api-cpu
+            env_file:
+              - .env
+            ports:
+              - "${PORT:-8001}:8000" # Adjust port if running alongside GPU version
+            environment:
+              - USE_CUDA=false # Ensure CPU is forced
+              - REDIS_HOST=whisper-redis-cpu # Point to the correct Redis service
+              - REDIS_PORT=6379 # Internal Redis port
+            depends_on:
+              - redis
+            # ... volumes, restart, etc. (No deploy.resources needed for CPU)
+
+        volumes:
+          redis_data_cpu:
+        ```
+    * After modifying `docker-compose.yml`, simply run:
+        ```bash
+        # For GPU image:
+        docker compose up -d whisper-api
+        # For CPU image (if using separate service name):
+        # docker compose up -d whisper-api-cpu
+        ```
+
+5.  **Access API:**
     * **API Docs (Swagger UI):** `http://localhost:8000/docs`
     * **Health Check:** `http://localhost:8000/health/`
 
@@ -120,8 +195,9 @@ Visit [KBLab's Whisper models on Hugging Face](https://huggingface.co/KBLab/kb-w
 1.  **Prerequisites:**
     * Python 3.10+
     * [uv](https://astral.sh/uv) (or pip + venv)
-    * FFmpeg: `sudo apt update && sudo apt install ffmpeg` (Debian/Ubuntu) or equivalent for your OS.
+    * FFmpeg: `sudo apt update && sudo apt install ffmpeg` (Debian/Ubuntu) or equivalent.
     * CUDA Toolkit (if using GPU) compatible with PyTorch.
+    * Redis Server: Install locally (`sudo apt install redis-server`) or use Docker.
 
 2.  **Clone & Setup:**
     ```bash
@@ -141,13 +217,14 @@ Visit [KBLab's Whisper models on Hugging Face](https://huggingface.co/KBLab/kb-w
 
     # Install dependencies for diarization (optional)
     uv pip install -e ".[diarization]"
+    uv pip install redis # Install the redis client library
     ```
 
 3.  **Configure & Run:**
     * Copy and edit the environment file:
         ```bash
         cp .env.example .env
-        # Edit .env file (e.g., set HUGGINGFACE_TOKEN if using diarization)
+        # Edit .env file (e.g., set HUGGINGFACE_TOKEN, REDIS_HOST, REDIS_PORT etc.)
         ```
     * Run the API server:
         ```bash
@@ -165,20 +242,25 @@ Configuration is managed via environment variables, typically set in the `.env` 
 
 **Key Settings:**
 
-| Variable                       | Description                                     | Example              | Default           |
-| :----------------------------- | :---------------------------------------------- | :------------------- | :---------------- |
-| `DEFAULT_MODEL`                | Default model ID to load on startup           | `kblab-large`        | `openai-base`     |
-| `USE_CUDA`                     | Use GPU acceleration if available               | `true`               | `true`            |
-| `MAX_CONCURRENT_TASKS`         | Max simultaneous transcription/diarization tasks | `1`                  | `1`               |
-| `DIARIZATION_ENABLED`          | Enable speaker identification feature           | `true`               | `true`            |
-| `HUGGINGFACE_TOKEN`            | HF token for downloading diarization models     | `hf_YourTokenHere`   | `""`              |
-| `API_AUTH_REQUIRED`            | Require `X-API-Key` header for requests         | `true`               | `false`           |
-| `API_KEY`                      | The secret API key if auth is required        | `your-secret-key`    | `""`              |
-| `AUTO_DELETE_AFTER_COMPLETION` | Delete audio files after task completion      | `true`               | `true`            |
-| `MODELS_CACHE_DIR`             | Directory to store downloaded models          | `/app/models`        | `/app/models`     |
-| `UPLOAD_DIR`                   | Directory for temporary audio file uploads      | `/app/uploads`       | `/app/uploads`    |
-| `LOG_LEVEL`                    | Logging level (e.g., INFO, DEBUG)             | `INFO`               | `INFO`            |
-
+| Variable                       | Description                                                                 | Example                               | Default           |
+| :----------------------------- | :-------------------------------------------------------------------------- | :------------------------------------ | :---------------- |
+| `DEFAULT_MODEL`                | Default model key to load. See `app/config.py` for full list.               | `kblab-large`, `openai-large-v3-turbo` | (Auto-detected)   |
+| `USE_CUDA`                     | Use GPU if available (`true`) or force CPU (`false`).                       | `true` / `false`                      | (Auto-detected)   |
+| `MAX_CONCURRENT_TASKS`         | Max simultaneous transcription/diarization tasks                            | `1`                                   | (Auto-detected)   |
+| `DIARIZATION_ENABLED`          | Enable speaker identification feature                                       | `true`                                | `true`            |
+| `HUGGINGFACE_TOKEN`            | HF token for downloading diarization models (required if enabled)           | `hf_YourTokenHere`                    | `""`              |
+| `API_AUTH_REQUIRED`            | Require `X-API-Key` header for requests                                     | `true`                                | `false`           |
+| `API_KEY`                      | The secret API key if auth is required                                    | `your-secret-key`                     | `""`              |
+| `AUTO_DELETE_AFTER_COMPLETION` | Delete audio files after task completion                                  | `true`                                | `true`            |
+| `MODELS_CACHE_DIR`             | Directory to store downloaded models (relative to project or absolute)      | `./models`                            | `./models`        |
+| `UPLOAD_DIR`                   | Directory for temporary audio file uploads (relative to project or absolute) | `./uploads`                           | `./uploads`       |
+| `LOG_LEVEL`                    | Logging level (e.g., INFO, DEBUG)                                         | `INFO`                                | `INFO`            |
+| `REDIS_HOST`                   | Hostname/IP of the Redis server                                             | `localhost` / `redis` (in Docker)     | `localhost`       |
+| `REDIS_PORT`                   | Port of the Redis server                                                    | `6379`                                | `6379`            |
+| `REDIS_DB`                     | Redis database number                                                       | `0`                                   | `0`               |
+| `REDIS_PASSWORD`               | Redis password (if required)                                                | `yourpassword`                        | `None`            |
+| `REDIS_KEY_PREFIX`             | Prefix for all keys stored in Redis                                         | `whisper_api:`                        | `whisper_api:`    |
+| `JOB_CLEANUP_HOURS`            | How long to keep completed/failed task results in Redis (hours)           | `24`                                  | `24`              |
 See `.env.example` for all available options and their default values.
 
 **Authentication:**
@@ -191,7 +273,28 @@ curl -H "X-API-Key: your_secret_api_key" http://localhost:8000/system/status
 
 </details>
 
-## 📊 API Endpoints
+## 💾 Resource Requirements
+
+Whisper models vary significantly in size and resource consumption. Here are *rough estimates* of VRAM (GPU memory) needed for common models when using float16 precision. CPU usage will also vary. RAM requirements are typically lower than VRAM but should be sufficient (e.g., 8GB+).
+
+| Model Key (`DEFAULT_MODEL`) | Estimated VRAM (fp16) | Notes                                     |
+| :-------------------------- | :-------------------- | :---------------------------------------- |
+| `kblab-tiny`                | ~1-2 GB               | Fastest, lowest accuracy, good for CPU    |
+| `kblab-small`               | ~3-4 GB               | Good balance for Swedish                  |
+| `kblab-medium`              | ~6-7 GB               | More accurate Swedish                     |
+| `kblab-large`               | ~11-12 GB             | Most accurate Swedish, requires more VRAM |
+| `openai-large-v3-turbo`     | ~11-12 GB             | High accuracy general model               |
+
+*   **CPU Mode:** If `USE_CUDA=false` or no GPU is detected, the API runs on the CPU. Performance will be significantly slower, especially for larger models. `kblab-tiny` is recommended for CPU-only operation.
+*   **Diarization:** The `pyannote.audio` model adds ~1-2 GB VRAM overhead when enabled.
+*   **Concurrency:** Running multiple tasks concurrently (`MAX_CONCURRENT_TASKS > 1`) multiplies the VRAM/CPU requirements.
+*   **Precision:** Using `float32` (`COMPUTE_TYPE=float32`) will roughly double VRAM usage compared to `float16` or `bfloat16`.
+
+Monitor your system's resource usage (`nvidia-smi` for GPU, `htop` for CPU/RAM) during operation to determine appropriate hardware and configuration.
+
+</details>
+
+## � API Endpoints
 
 API documentation is available via Swagger UI at `/docs` and ReDoc at `/redoc` when the server is running.
 
@@ -345,6 +448,7 @@ This API includes several features to enhance privacy:
 * **Configurable Logging:** Set `LOG_LEVEL` (e.g., `INFO`, `WARNING`, `ERROR`) to control verbosity and minimize potentially sensitive data in logs.
 * **API Authentication:** Use `API_AUTH_REQUIRED=true` and a strong `API_KEY` to prevent unauthorized access.
 * **HTTPS:** Deploy behind a reverse proxy (like Nginx or Traefik) configured with TLS/SSL certificates to encrypt API traffic in production.
+* **Redis Storage:** Task metadata and results (for `JOB_CLEANUP_HOURS`) are stored in Redis. Secure your Redis instance appropriately (e.g., password protection, network isolation).
 
 </details>
 
@@ -388,6 +492,16 @@ This API includes several features to enhance privacy:
 
 </details>
 
-## 📄 License
+## 🔄 Continuous Integration & Deployment (CI/CD)
+
+This project uses GitHub Actions for automated workflows:
+
+*   **CI (`ci.yml`):** Runs on every push and pull request to the `main` branch.
+    *   Performs linting (`ruff`), type checking (`mypy`), and runs tests (`pytest`).
+*   **Docker Release (`release.yml`):** Runs when a version tag (e.g., `v1.2.0`) is pushed.
+    *   Builds CPU and GPU Docker images.
+    *   Pushes images to [GitHub Container Registry (GHCR)](https://github.com/CCimen/whisper-api/pkgs/container/whisper-api).
+
+## � License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

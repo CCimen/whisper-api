@@ -17,8 +17,9 @@ from pydantic import BaseModel, Field, validator
 # Use the central router registry
 from app.api.router_registry import router_diarization
 from app.config import settings
-from app.services.task_manager import task_manager, TaskStatus
+from app.services.task_manager import TaskManager, TaskStatus # Import class, not instance
 from app.exceptions import ConfigurationError
+from app.dependencies import get_task_manager # Import dependency function
 
 # Import security dependency
 from app.main import get_api_key # Import from main where it's defined
@@ -132,6 +133,7 @@ async def submit_diarization_only_job(
     audio_file: UploadFile = File(..., description="The audio file to diarize."),
     # API Key Dependency applied at the router level in main.py
     # _: bool = Depends(get_api_key)
+    tm: TaskManager = Depends(get_task_manager)
 ):
     """
     Submit an audio file for speaker diarization ONLY (no transcription).
@@ -170,10 +172,10 @@ async def submit_diarization_only_job(
         task_params = {k: v for k, v in task_params.items() if v is not None} # Filter None
 
         logger.info(f"Creating diarization_only task with parameters: {task_params}")
-        task_id = task_manager.create_task("diarization_only", task_params)
-        await task_manager.queue_task(task_id)
+        task_id = await tm.create_task("diarization_only", task_params) # Use tm, await create_task
+        await tm.queue_task(task_id) # Use tm
 
-        initial_task_info = task_manager.get_task(task_id, include_result=False)
+        initial_task_info = await tm.get_task(task_id, include_result=False) # Use tm, await get_task
         if not initial_task_info:
             raise HTTPException(status_code=500, detail="Failed to retrieve task status after creation.")
 
@@ -200,10 +202,10 @@ async def submit_diarization_only_job(
 
 
 @router_diarization.get("/{task_id}/status", response_model=DiarizationResponse)
-async def get_diarization_task_status(task_id: str):
+async def get_diarization_task_status(task_id: str, tm: TaskManager = Depends(get_task_manager)):
      # API Key Dependency applied at the router level in main.py
     """Check the current status and progress of a diarization-only job."""
-    task_info = task_manager.get_task(task_id, include_result=False)
+    task_info = await tm.get_task(task_id, include_result=False) # Use tm, await get_task
     if not task_info:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Task ID '{task_id}' not found.")
     if task_info.get("type") != "diarization_only":
@@ -219,12 +221,12 @@ async def get_diarization_task_status(task_id: str):
 
 
 @router_diarization.get("/{task_id}", response_model=DiarizationResponse)
-async def get_diarization_task_result(task_id: str):
+async def get_diarization_task_result(task_id: str, tm: TaskManager = Depends(get_task_manager)):
      # API Key Dependency applied at the router level in main.py
     """
     Retrieve the results of a completed diarization-only job.
     """
-    task_info = task_manager.get_task(task_id, include_result=True)
+    task_info = await tm.get_task(task_id, include_result=True) # Use tm, await get_task
     if not task_info:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Task ID '{task_id}' not found.")
     if task_info.get("type") != "diarization_only":
@@ -244,14 +246,14 @@ async def get_diarization_task_result(task_id: str):
 
 
 @router_diarization.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_diarization_task(task_id: str):
+async def delete_diarization_task(task_id: str, tm: TaskManager = Depends(get_task_manager)):
      # API Key Dependency applied at the router level in main.py
     """
     Delete a diarization-only task record and associated temporary files.
     If the task is running, it will be cancelled first.
     """
     # 1. Get task info and validate
-    task_info = task_manager.get_task(task_id, include_result=False)
+    task_info = await tm.get_task(task_id, include_result=False) # Use tm, await get_task
     if not task_info:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Task ID '{task_id}' not found.")
     if task_info.get("type") != "diarization_only":
@@ -267,11 +269,11 @@ async def delete_diarization_task(task_id: str):
         # 3. Cancel the task if active or queued
         logger.info(f"Task {task_id} is in state {current_status}. Attempting cancellation before deletion.")
         try:
-            cancelled_successfully = await task_manager.cancel_task(task_id)
+            cancelled_successfully = await tm.cancel_task(task_id) # Use tm
             if not cancelled_successfully:
                  # This might happen if the task finished between the get_task and cancel_task calls
                  logger.warning(f"Cancellation signal for task {task_id} returned False. Checking status again.")
-                 task_info = task_manager.get_task(task_id, include_result=False)
+                 task_info = await tm.get_task(task_id, include_result=False) # Use tm, await get_task
                  if task_info and not TaskStatus.is_terminal(TaskStatus(task_info["status"])):
                       # If still not terminal after failed cancel signal, something is wrong
                       raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to effectively cancel task {task_id} before deletion.")
@@ -282,7 +284,7 @@ async def delete_diarization_task(task_id: str):
             poll_interval = 0.5   # Adjust as needed
 
             while True:
-                task_info = task_manager.get_task(task_id, include_result=False)
+                task_info = await tm.get_task(task_id, include_result=False) # Use tm, await get_task
                 if not task_info: # Task might have been deleted concurrently? Unlikely but possible
                     logger.warning(f"Task {task_id} disappeared during cancellation wait.")
                     return None # Treat as deleted
@@ -307,7 +309,7 @@ async def delete_diarization_task(task_id: str):
 
 
     # 5. Delete the task record (now that it's terminal or timed out)
-    deleted = task_manager.delete_task(task_id) # delete_task handles the actual file cleanup
+    deleted = await tm.delete_task(task_id) # Use tm, await delete_task
     if not deleted:
          # This could happen if the task was deleted by another process between wait and delete
          logger.warning(f"Attempted to delete task {task_id}, but it was not found (possibly deleted concurrently).")

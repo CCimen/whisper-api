@@ -126,17 +126,7 @@ def get_optimal_defaults(capabilities: Dict[str, Any]) -> Dict[str, Any]:
          defaults["max_models_in_memory"] = 1
          defaults["parallel_processing"] = False
 
-    # Log detected capabilities and chosen defaults
-    if cuda_available:
-        logger.info(f"Detected {capabilities['device_count']} CUDA device(s) with "
-                    f"{capabilities['total_memory_gb']:.1f}GB total memory.")
-    else:
-        logger.warning("No CUDA devices detected. Using CPU-compatible defaults. Performance will be significantly lower.")
-
-    logger.info(f"Setting optimal defaults: model={defaults['default_model']}, "
-                f"concurrent_tasks={defaults['max_concurrent_tasks']}, "
-                f"parallel_diarization={defaults['parallel_processing']}")
-
+    # Logging moved to main.py lifespan startup to avoid duplication per worker
     return defaults
 
 def generate_secure_key(byte_length: int = 32) -> str:
@@ -225,6 +215,14 @@ class Settings(BaseSettings):
     # Audit logging
     AUDIT_LOGGING_ENABLED: bool = False
     AUDIT_LOG_PATH: str = "./logs/audit.log" # Default relative path
+
+    # --- Redis Settings (for Task Management & potentially Sessions) ---
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
+    REDIS_PASSWORD: Optional[str] = None
+    REDIS_TIMEOUT: int = 10 # Connection timeout seconds
+    REDIS_KEY_PREFIX: str = "whisper_api:" # Prefix for all Redis keys
 
     # Input validation
     ALLOWED_FILE_EXTENSIONS: List[str] = Field(
@@ -410,19 +408,19 @@ if settings:
     create_secure_directories()
     check_storage_paths()
 
-    # --- Log Final Configuration Summary ---
-    logger.info("--- Configuration Summary ---")
-    logger.info(f"Default Model: {settings.DEFAULT_MODEL}")
-    logger.info(f"Use CUDA: {settings.USE_CUDA} (Device: {settings.CUDA_DEVICE if settings.USE_CUDA else 'N/A'})")
-    logger.info(f"Max Concurrent Tasks: {settings.MAX_CONCURRENT_TASKS}")
-    logger.info(f"Diarization Enabled: {settings.DIARIZATION_ENABLED}")
-    logger.info(f"Auto Delete Files: {settings.AUTO_DELETE_AFTER_COMPLETION}")
-    logger.info(f"API Auth Required: {settings.API_AUTH_REQUIRED}")
-    logger.info(f"Upload Dir: {settings.UPLOAD_DIR}")
-    logger.info(f"Results Dir: {settings.RESULTS_DIR}")
-    logger.info(f"Models Cache Dir: {settings.MODELS_CACHE_DIR}")
-    logger.info(f"Audit Logging Enabled: {settings.AUDIT_LOGGING_ENABLED}")
-    logger.info("--- End Configuration Summary ---")
+    # --- Log Final Configuration Summary --- (Commented out to reduce multi-worker log duplication)
+    # logger.info("--- Configuration Summary ---")
+    # logger.info(f"Default Model: {settings.DEFAULT_MODEL}")
+    # logger.info(f"Use CUDA: {settings.USE_CUDA} (Device: {settings.CUDA_DEVICE if settings.USE_CUDA else 'N/A'})")
+    # logger.info(f"Max Concurrent Tasks: {settings.MAX_CONCURRENT_TASKS}")
+    # logger.info(f"Diarization Enabled: {settings.DIARIZATION_ENABLED}")
+    # logger.info(f"Auto Delete Files: {settings.AUTO_DELETE_AFTER_COMPLETION}")
+    # logger.info(f"API Auth Required: {settings.API_AUTH_REQUIRED}")
+    # logger.info(f"Upload Dir: {settings.UPLOAD_DIR}")
+    # logger.info(f"Results Dir: {settings.RESULTS_DIR}")
+    # logger.info(f"Models Cache Dir: {settings.MODELS_CACHE_DIR}")
+    # logger.info(f"Audit Logging Enabled: {settings.AUDIT_LOGGING_ENABLED}")
+    # logger.info("--- End Configuration Summary ---")
 
     # --- Security Warnings ---
     if not settings.API_AUTH_REQUIRED:

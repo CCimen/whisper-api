@@ -14,74 +14,66 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 from transformers.pipelines.audio_utils import ffmpeg_read
 
 from app.config import settings, WHISPER_MODEL_MAPPING
-# Correct import path for exceptions
 from app.exceptions import ModelNotFoundError, TranscriptionError
-# Correct import path for base class
 from app.services.model_registry import TranscriptionModel, ModelRegistry
 
 logger = logging.getLogger(__name__)
 
-# Define default compute types based on device
 DEFAULT_COMPUTE_TYPES = {
     "cuda": torch.float16,
     "cpu": torch.float32,
     "mps": torch.float32 # Mac Silicon
 }
 
-@ModelRegistry.register # Automatically register this class
+@ModelRegistry.register
 class WhisperModel(TranscriptionModel):
     """
     Whisper transcription model implementation using Hugging Face Transformers.
     Handles model loading, unloading, and transcription execution.
     """
-    # Class-level lock for thread safety during loading/unloading
     _model_lock = threading.RLock()
     
     def __init__(self, model_size: str):
-        # Validate model_size against the mapping keys from config
         if model_size not in WHISPER_MODEL_MAPPING:
             available_keys = list(WHISPER_MODEL_MAPPING.keys())
             raise ModelNotFoundError(f"Invalid model size '{model_size}'. Available configured sizes: {available_keys}")
 
         self.model_size = model_size
         self.model_id = WHISPER_MODEL_MAPPING[model_size]
-        self.name = f"whisper-{model_size}" # Name used in the registry
+        self.name = f"whisper-{model_size}"
 
-        self._model = None # Strong reference
-        self._processor = None # Strong reference
-        self._pipeline = None # Strong reference
+        self._model = None
+        self._processor = None
+        self._pipeline = None
         self._loaded_device = None
-        self._loaded_dtype = None # Store the actual dtype used
+        self._loaded_dtype = None
         self._loaded = False
         logger.info(f"[MODEL:{self.name}] Initialized wrapper (ID: {self.model_id})")
 
     def _get_compute_settings(self, device_str: str) -> Tuple[torch.device, torch.dtype]:
         """Determine optimal compute type (dtype) based on config and device."""
-        if not torch: # Check if torch is available
+        if not torch:
             logger.error("PyTorch is not available. Cannot determine compute settings.")
-            # Return CPU float32 as a fallback, but things will likely fail later
             return torch.device("cpu"), torch.float32
 
         device = torch.device(device_str)
-        torch_dtype = DEFAULT_COMPUTE_TYPES.get(device.type, torch.float32) # Default based on device
+        torch_dtype = DEFAULT_COMPUTE_TYPES.get(device.type, torch.float32)
 
         compute_type_setting = settings.COMPUTE_TYPE.lower()
 
         if compute_type_setting == "auto":
             if device.type == "cuda":
-                 # Check for bfloat16 support (Ampere or newer)
                  if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
                       torch_dtype = torch.bfloat16
                       logger.info(f"[MODEL:{self.name}] Using auto compute type: bfloat16 (bf16) on CUDA.")
                  else:
                       torch_dtype = torch.float16
                       logger.info(f"[MODEL:{self.name}] Using auto compute type: float16 (fp16) on CUDA.")
-            # Add elif for MPS if needed
-            else: # CPU
+            else: # CPU (or other non-CUDA devices)
                  torch_dtype = torch.float32
                  logger.info(f"[MODEL:{self.name}] Using auto compute type: float32 on CPU.")
         elif compute_type_setting == "float16":
-             if device.type == "cuda": # Only use fp16 on CUDA
+             if device.type == "cuda":
                   torch_dtype = torch.float16
                   logger.info(f"[MODEL:{self.name}] Forcing compute type: float16 (fp16).")
              else:
@@ -93,29 +85,25 @@ class WhisperModel(TranscriptionModel):
                   logger.info(f"[MODEL:{self.name}] Forcing compute type: bfloat16 (bf16).")
              else:
                   logger.warning(f"[MODEL:{self.name}] bfloat16 requested but not supported on this device. Using defaults.")
-                  # Fallback based on device type
                   torch_dtype = DEFAULT_COMPUTE_TYPES.get(device.type, torch.float32)
         elif compute_type_setting == "float32":
              torch_dtype = torch.float32
              logger.info(f"[MODEL:{self.name}] Forcing compute type: float32.")
         else:
              logger.warning(f"[MODEL:{self.name}] Unknown COMPUTE_TYPE '{settings.COMPUTE_TYPE}'. Using defaults.")
-             # Default based on device type already set
 
         return device, torch_dtype
 
     def load(self, device: Optional[str] = None):
         """Load the model and processor into memory."""
         with self._model_lock:
-            # First check if truly loaded (protect against false positives)
             if self._loaded and self.is_loaded():
                 logger.info(f"[MODEL:{self.name}] Already loaded on {self._loaded_device}.")
                 return
                 
-            # Reset loaded flag as we're starting the loading process
             self._loaded = False
 
-            if not torch: # Cannot load without PyTorch
+            if not torch:
                  raise TranscriptionError("PyTorch not available, cannot load model.")
 
             logger.info(f"[MODEL:{self.name}] Loading model (ID: {self.model_id})...")
@@ -126,27 +114,22 @@ class WhisperModel(TranscriptionModel):
             target_device, torch_dtype = self._get_compute_settings(target_device_str)
 
             try:
-                # Clean memory before loading large model (Removed explicit gc.collect/empty_cache)
-                # gc.collect()
                 if target_device.type == "cuda":
-                    # torch.cuda.empty_cache() # Removed explicit call
                     torch.cuda.empty_cache()
 
-                # Load model using optimal settings from config
                 logger.info(f"[MODEL:{self.name}] Downloading/loading model weights for {self.model_id}...")
                 model = AutoModelForSpeechSeq2Seq.from_pretrained(
                     self.model_id,
                     torch_dtype=torch_dtype,
-                    low_cpu_mem_usage=True, # Use less CPU RAM during loading
+                    low_cpu_mem_usage=True,
                     use_safetensors=True,
                     cache_dir=settings.MODELS_CACHE_DIR,
-                    # attn_implementation="flash_attention_2" # Requires flash-attn library installed
+                    # attn_implementation="flash_attention_2" # Optional: Requires flash-attn
                 )
                 logger.info(f"[MODEL:{self.name}] Model weights loaded. Moving to device {target_device}...")
                 model.to(target_device)
-                model.eval() # Set to evaluation mode
+                model.eval()
 
-                # Load processor
                 logger.info(f"[MODEL:{self.name}] Downloading/loading processor for {self.model_id}...")
                 processor = AutoProcessor.from_pretrained(
                     self.model_id,
@@ -154,7 +137,6 @@ class WhisperModel(TranscriptionModel):
                 )
                 logger.info(f"[MODEL:{self.name}] Processor loaded.")
 
-                # Create pipeline
                 logger.info(f"[MODEL:{self.name}] Creating ASR pipeline...")
                 whisper_pipeline = pipeline(
                     "automatic-speech-recognition",
@@ -166,17 +148,14 @@ class WhisperModel(TranscriptionModel):
                 )
                 logger.info(f"[MODEL:{self.name}] ASR pipeline created.")
 
-                # Store strong references
                 self._model = model
                 self._processor = processor
                 self._pipeline = whisper_pipeline
                 self._loaded_device = target_device
-                self._loaded_dtype = torch_dtype # Store the actual dtype used
+                self._loaded_dtype = torch_dtype
                 
-                # Only mark as loaded when everything is successful
                 self._loaded = True
 
-                # Verify everything is properly loaded before returning
                 if not self.is_loaded():
                     raise TranscriptionError(f"[MODEL:{self.name}] References were immediately garbage collected after loading. Memory may be too constrained.")
 
@@ -185,7 +164,7 @@ class WhisperModel(TranscriptionModel):
 
             except Exception as e:
                 logger.exception(f"[MODEL:{self.name}] Error loading model: {e}")
-                self.unload() # Ensure cleanup if loading failed
+                self.unload()
                 raise TranscriptionError(f"[MODEL:{self.name}] Failed to load model: {e}")
 
     def unload(self):
@@ -198,7 +177,6 @@ class WhisperModel(TranscriptionModel):
             unload_start_time = time.time()
 
             # Clear strong references
-            # Keep local copies for potential cleanup if needed, though GC should handle it
             pipeline_obj = self._pipeline
             model_obj = self._model
             processor_obj = self._processor
@@ -206,20 +184,14 @@ class WhisperModel(TranscriptionModel):
             self._pipeline = None
             self._model = None
             self._processor = None
-            self._loaded = False  # Reset loaded state immediately
+            self._loaded = False
 
-            # Delete objects (Python GC will handle actual memory release)
+            # Hint to GC
             del pipeline_obj
             del model_obj
             del processor_obj
 
-            # Force garbage collection and clear CUDA cache (Removed explicit calls)
-            # gc.collect()
-            # if self._loaded_device and self._loaded_device.type == "cuda" and torch and torch.cuda.is_available():
-            #      try:
-            #           torch.cuda.empty_cache()
-            #      except Exception as e:
-            #           logger.warning(f"[MODEL:{self.name}] Error emptying CUDA cache during unload: {e}")
+            # Explicit GC and cache clearing might be added back if memory issues persist
 
             self._loaded_device = None
             self._loaded_dtype = None
@@ -230,21 +202,17 @@ class WhisperModel(TranscriptionModel):
     def is_loaded(self) -> bool:
         """Check if the model is currently loaded and all components are available."""
         with self._model_lock:
-            # Basic check first
             if not self._loaded:
                 return False
             
-            # Verify all strong references are assigned
             model_valid = self._model is not None
             processor_valid = self._processor is not None
             pipeline_valid = self._pipeline is not None
 
-            # If any reference is missing but _loaded is True, something went wrong. Reset.
             if not (model_valid and processor_valid and pipeline_valid):
-                if self._loaded: # Only log warning if it was supposedly loaded
+                if self._loaded:
                      logger.warning(f"[MODEL:{self.name}] Marked as loaded but internal references are missing. Resetting loaded state.")
                 self._loaded = False
-                # Also clear any potentially lingering partial references
                 self._model = None
                 self._processor = None
                 self._pipeline = None
@@ -256,7 +224,7 @@ class WhisperModel(TranscriptionModel):
         self,
         audio_path: str,
         language: Optional[str] = None,
-        task: str = "transcribe", # transcribe or translate
+        task: str = "transcribe",
         progress_callback: Optional[Callable[[float], None]] = None # Note: Pipeline doesn't support fine-grained progress
     ) -> Dict[str, Any]:
         """
@@ -271,16 +239,14 @@ class WhisperModel(TranscriptionModel):
         Returns:
             Dictionary containing transcription results ('text', 'segments', 'language', etc.).
         """
-        # Verify model is loaded before proceeding
         with self._model_lock:
             if not self.is_loaded():
                  raise TranscriptionError(f"[MODEL:{self.name}] Not loaded. Call load() first.")
             
-            # Use the strong reference to the pipeline
             pipe = self._pipeline
             if pipe is None:
-                 # This shouldn't happen if is_loaded() passed, but check defensively
-                 self._loaded = False # Reset loaded state
+                 # Defensive check: This shouldn't happen if is_loaded() passed
+                 self._loaded = False
                  raise TranscriptionError(f"[MODEL:{self.name}] Pipeline object missing unexpectedly. Call load() first.")
                 
         if not torch:
@@ -294,15 +260,14 @@ class WhisperModel(TranscriptionModel):
         if language:
             generate_kwargs["language"] = language
         else:
-             generate_kwargs["language"] = None # Explicitly None for auto-detection by pipeline
+             generate_kwargs["language"] = None # Let pipeline handle auto-detection
 
         # Set optimal batch size and chunk length from settings, if provided
-        batch_size = settings.WHISPER_BATCH_SIZE if settings.WHISPER_BATCH_SIZE is not None else 16 # Default pipeline batch size
-        chunk_length_s = settings.WHISPER_CHUNK_LENGTH if settings.WHISPER_CHUNK_LENGTH is not None else 30 # Default pipeline chunk length
+        batch_size = settings.WHISPER_BATCH_SIZE if settings.WHISPER_BATCH_SIZE is not None else 16
+        chunk_length_s = settings.WHISPER_CHUNK_LENGTH if settings.WHISPER_CHUNK_LENGTH is not None else 30
 
         # Read audio file using utility compatible with pipeline
         try:
-            # Ensure feature_extractor exists before accessing sampling_rate
             if pipe.feature_extractor:
                  sampling_rate = pipe.feature_extractor.sampling_rate
             else:
@@ -325,47 +290,37 @@ class WhisperModel(TranscriptionModel):
              raise TranscriptionError(f"[MODEL:{self.name}] Failed to read or process audio file: {e}")
 
 
-        if progress_callback: progress_callback(0.1) # Progress after loading audio
+        if progress_callback: progress_callback(0.1)
 
         # Execute transcription
         try:
-            # Run in inference mode for efficiency
             with torch.inference_mode():
                 result = pipe(
-                    inputs, # Pass the loaded numpy array
+                    inputs,
                     chunk_length_s=chunk_length_s,
                     batch_size=batch_size,
-                    return_timestamps=True, # Get word/segment timestamps
+                    return_timestamps=True,
                     generate_kwargs=generate_kwargs,
-                    # return_language=True # Included by default in newer transformers? Check output.
+                    # return_language=True # Optional: Check if needed based on transformers version
                 )
-            if progress_callback: progress_callback(0.9) # Progress after transcription
+            if progress_callback: progress_callback(0.9)
 
         except Exception as e:
             logger.exception(f"[MODEL:{self.name}] Pipeline execution failed: {e}")
-            # Clean up memory on error (Removed explicit calls)
-            # gc.collect()
-            # if self._loaded_device and self._loaded_device.type == "cuda":
-            #     torch.cuda.empty_cache()
+            # Explicit GC/cache clearing might be needed here on error if memory issues occur
             raise TranscriptionError(f"[MODEL:{self.name}] Transcription pipeline failed: {e}")
 
         # Process results
         full_text = result.get("text", "")
-        # Language detection might be nested or top-level depending on transformers version
+        # Language detection result might be nested or top-level depending on transformers version.
+        # Fallback to requested language or 'unknown'.
         detected_language = result.get("language", generate_kwargs.get("language") or "unknown")
-        if not detected_language or detected_language == "unknown":
-             # Try looking in generate_kwargs if pipeline result doesn't include it explicitly
-             # Often the result dict itself contains the detected language if None was passed.
-             # This part might need adjustment based on specific transformers version behavior.
-             pass # Keep default 'unknown' if not found
-
         segments = []
         if "chunks" in result and isinstance(result["chunks"], list):
             for chunk in result["chunks"]:
                 timestamp = chunk.get("timestamp")
                 if isinstance(timestamp, (tuple, list)) and len(timestamp) == 2:
                     start, end = timestamp
-                    # Check if timestamps are valid numbers before rounding
                     if isinstance(start, (int, float)) and isinstance(end, (int, float)):
                         segments.append({
                             "start": round(start, 3),
@@ -388,12 +343,9 @@ class WhisperModel(TranscriptionModel):
         if duration > 0 and processing_time > 0:
              logger.info(f"[MODEL:{self.name}] Realtime factor: {duration / processing_time:.2f}x")
 
-        if progress_callback: progress_callback(1.0) # Final progress
+        if progress_callback: progress_callback(1.0)
 
-        # Clean memory after successful transcription (Removed explicit calls)
-        # gc.collect()
-        # if self._loaded_device and self._loaded_device.type == "cuda":
-        #     torch.cuda.empty_cache()
+        # Explicit GC/cache clearing might be needed here if memory issues occur
 
         return {
             "text": full_text.strip(),
@@ -401,5 +353,5 @@ class WhisperModel(TranscriptionModel):
             "language": detected_language,
             "duration": round(duration, 3),
             "processing_time": round(processing_time, 3),
-            "model": self.name, # Return the model name used
+            "model": self.name,
         }

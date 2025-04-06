@@ -36,127 +36,106 @@ app/
 
 ### High-Level Overview
 
-The following diagram shows the simplified flow of a transcription request through the system:
+The following diagram shows the simplified flow of a transcription request through the system, highlighting the role of Redis:
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant API as FastAPI API
-    participant TaskMgr as Task Manager
-    participant Processor as Audio Processor
-    participant Model as Model Components
+    participant API as FastAPI Worker
+    participant Redis
+    participant WorkerN as FastAPI Worker N
 
-    User->>API: Submit audio for transcription
-    API->>TaskMgr: Create and queue task
-    API-->>User: Return task ID
-    
-    Note over TaskMgr: Task queued until worker available
-    
-    TaskMgr->>Processor: Process audio file
-    Processor->>Model: Request model & transcribe
-    Model-->>Processor: Return transcription
-    
-    opt Diarization Requested
-        Processor->>Processor: Add speaker identification
+    User->>API: POST /transcriptions/ (audio)
+    API->>Redis: HSET task:<id> status=PENDING, params=..., cancelled=false
+    API->>Redis: LPUSH task_queue <id>
+    API-->>User: 202 Accepted (task_id)
+
+    Note over WorkerN, Redis: Worker N waits via BRPOP task_queue
+    Redis-->>WorkerN: <id> (Task ID popped)
+    WorkerN->>Redis: SADD active_tasks <id>
+    WorkerN->>Redis: HSET task:<id> status=PROCESSING, started_at=...
+    Note over WorkerN: Worker checks HGET task:<id> cancelled periodically
+    alt Task Cancelled During Processing
+        WorkerN->>Redis: HGET task:<id> cancelled -> "true"
+        Note over WorkerN: Abort processing, cleanup local files
+        WorkerN->>Redis: HSET task:<id> status=CANCELLED, completed_at=...
+        WorkerN->>Redis: SREM active_tasks <id>
+    else Task Completes Normally
+        Note over WorkerN: Processes audio (calls Processor -> Model/Diarization)
+        WorkerN->>Redis: HSET task:<id> progress=... (Periodically via callback)
+        Note over WorkerN: Processing complete
+        WorkerN->>Redis: SET result:<id> {result_json} EX <ttl>
+        WorkerN->>Redis: HSET task:<id> status=COMPLETED, result_key=result:<id>, completed_at=...
+        WorkerN->>Redis: SREM active_tasks <id>
+    else Task Fails During Processing
+        Note over WorkerN: Catches exception
+        WorkerN->>Redis: HSET task:<id> status=FAILED, error=..., completed_at=...
+        WorkerN->>Redis: SREM active_tasks <id>
     end
-    
-    Processor-->>TaskMgr: Store completed result
-    
-    User->>API: Request task result
-    API->>TaskMgr: Get task data
-    TaskMgr-->>API: Return result
-    API-->>User: Deliver transcription
+
+    User->>API: GET /transcriptions/<id>
+    API->>Redis: HGETALL task:<id>
+    alt Task Completed
+        Redis-->>API: Task details (status=COMPLETED, result_key=...)
+        API->>Redis: GET result:<id>
+        Redis-->>API: {result_json}
+        API-->>User: 200 OK (Full result)
+    else Task Pending/Processing/Cancelled
+        Redis-->>API: Task details (status=...)
+        API-->>User: 200 OK (Status only)
+    else Task Failed
+         Redis-->>API: Task details (status=FAILED, error=...)
+         API-->>User: 200 OK (Status with error)
+    end
 ```
 
-<details>
-<summary><b>Click to view detailed workflow diagram</b></summary>
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant API as FastAPI API
-    participant TaskMgr as Task Manager
-    participant Processor as Audio Processor
-    participant ModelReg as Model Registry
-    participant WhisperMod as Whisper Model
-    participant DiarizationSvc as Diarization Service
-
-    User->>API: POST /transcriptions/ (audio file, params)
-    API->>TaskMgr: create_task(type="transcription", params)
-    TaskMgr-->>API: task_id
-    API->>TaskMgr: queue_task(task_id)
-    TaskMgr-->>API: Queued status (task_id, queue_position)
-    API-->>User: 202 Accepted (task_id, status="queued")
-
-    Note over TaskMgr: Worker becomes available
-    TaskMgr->>Processor: process_audio(task_id, params, callback)
-    Processor->>ModelReg: get_model(model_key)
-    ModelReg->>WhisperMod: Check if loaded
-    
-    alt Model Not Loaded
-        WhisperMod-->>ModelReg: Not loaded
-        ModelReg-->>Processor: Model instance (not loaded)
-        Processor->>TaskMgr: Update Status: LOADING_MODEL
-        Processor->>WhisperMod: load(device)
-        Note over WhisperMod: Downloads/loads model weights
-        WhisperMod-->>Processor: Model loaded
-    else Model Already Loaded
-        WhisperMod-->>ModelReg: Loaded
-        ModelReg-->>Processor: Model instance (loaded)
-    end
-    
-    Processor->>TaskMgr: Update Status: PROCESSING
-    Processor->>WhisperMod: transcribe(audio_path, ...)
-    WhisperMod-->>Processor: Transcription result
-    
-    opt Diarization Requested
-        Processor->>DiarizationSvc: diarize_file(...)
-        DiarizationSvc-->>Processor: Diarization results (DataFrame)
-        Note over Processor: Assign speakers to segments
-    end
-    
-    Processor->>TaskMgr: Update Status: COMPLETED, Result
-    Processor-->>TaskMgr: Return final result dict
-
-    Note over User, API: User polls for status/result
-    User->>API: GET /transcriptions/{task_id}
-    API->>TaskMgr: get_task(task_id)
-    TaskMgr-->>API: Task details (status, result)
-    API-->>User: 200 OK (Transcription result)
-```
-</details>
+<!-- Removed outdated detailed diagram -->
 
 ### Workflow Explained:
 
 1. **Request Handling**:
-   - User sends a POST request with audio file and parameters
-   - API validates the request and creates a task
-   - User receives a task ID immediately
+   - User sends a POST request with audio file and parameters.
+   - API (FastAPI Worker) validates the request.
+   - `TaskManager` creates task metadata in a Redis Hash (`task:<id>`).
+   - `TaskManager` pushes the `task_id` onto the Redis List (`task_queue`).
+   - API returns the `task_id` and `queued` status to the user.
 
-2. **Task Processing**:
-   - Task enters queue and waits for an available worker
-   - When processing begins, system checks if the requested model is loaded
-   - If needed, model is loaded from Hugging Face
-   - Audio is transcribed using the Whisper model
+2. **Task Processing (by any available worker)**:
+   - A worker process uses `BRPOP` to wait for and retrieve a `task_id` from `task_queue`.
+   - Worker adds `task_id` to the `active_tasks` Redis Set.
+   - Worker updates the task status to `PROCESSING` in the Redis Hash.
+   - Worker calls the `Audio Processor`.
+   - `Processor` gets the required model via `ModelRegistry` (loading if necessary).
+   - `Processor` calls the model's `transcribe` method.
+   - `Processor` periodically updates task progress in the Redis Hash via callbacks.
 
 3. **Optional Diarization**:
-   - If requested, the `DiarizationService` is called to perform speaker recognition.
-   - The `Processor` then assigns the identified speakers to the transcription segments.
+   - If requested, the `Processor` calls the `DiarizationService`.
+   - The `Processor` assigns identified speakers to transcription segments.
 
-4. **Result Retrieval**:
-   - User polls for task status using the task ID
-   - Once completed, transcription results are returned
+4. **Task Completion**:
+   - On success: `Processor` returns the result dictionary. The worker stores the result JSON in a Redis String (`result:<id>`) with a TTL, updates the task hash status to `COMPLETED` (including the `result_key`), and removes the `task_id` from `active_tasks`.
+   - On failure: Worker catches the exception, updates the task hash status to `FAILED` with the error message, and removes the `task_id` from `active_tasks`.
+   - On cancellation: If the `cancelled` flag in the task hash is set to `true`, the worker aborts processing, updates status to `CANCELLED`, and removes from `active_tasks`.
 
-5. **Cleanup**:
-   - Files are automatically deleted based on configuration
+5. **Result Retrieval**:
+   - User polls `GET /transcriptions/{task_id}`.
+   - API worker fetches task details from the Redis Hash (`task:<id>`).
+   - If status is `COMPLETED`, the API worker fetches the result JSON from the `result:<id>` key in Redis.
+   - API returns the status and potentially the full result to the user.
+
+6. **Cleanup**:
+   - Uploaded files are deleted after processing based on configuration.
+   - Task results in Redis expire automatically based on `JOB_CLEANUP_HOURS`.
+   - Task metadata hashes remain until explicitly deleted or cleaned up by a potential future cleanup job.
 
 ## 🔑 Key Components
 
 * **FastAPI (`app/main.py`, `app/api/`)**: 
   Handles HTTP requests, routing, validation, and responses
 
-* **TaskManager (`app/services/task_manager.py`)**: 
-  Manages asynchronous tasks - queuing, execution, status tracking, and cleanup
+* **Redis**: Acts as the central message broker and database for task queue, task state/metadata, results, and active task tracking.
+* **TaskManager (`app/services/task_manager.py`)**: Interacts with Redis to manage the lifecycle of asynchronous tasks (creation, queuing, status updates, result storage, cancellation). Runs a background loop in each worker to process tasks from the Redis queue.
 
 * **Audio Processor (`app/services/processor.py`)**: 
   Orchestrates audio processing steps - model acquisition, transcription, diarization

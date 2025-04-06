@@ -2,15 +2,17 @@
 API Endpoint for basic health checks.
 """
 import logging
+from typing import Optional # Added import
 import torch
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, Response, status, Depends # Import Depends
 
 # Import the specific router instance for health checks
 from app.api.router_registry import router_health
 # Import necessary components for checks
 from app.config import settings
 from app.services.model_registry import ModelRegistry
-from app.services.diarization import diarization_service, DIARIZATION_AVAILABLE
+from app.services.diarization import DIARIZATION_AVAILABLE, DiarizationService # Keep AVAILABLE, import class for type hint
+from app.dependencies import get_diarization_service # Import dependency function
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +22,11 @@ logger = logging.getLogger(__name__)
     description="A simple endpoint to verify that the API service is running and responsive.",
     tags=["Health"] # Match tag defined in registry
 )
-async def health_check(response: Response):
+async def health_check(
+    response: Response,
+    # Inject the service instance (will be None if disabled/unavailable)
+    diar_service: Optional[DiarizationService] = Depends(get_diarization_service)
+):
     """
     Performs health checks on critical components and returns the status.
     Returns 503 Service Unavailable if a critical check fails.
@@ -67,15 +73,17 @@ async def health_check(response: Response):
 
     # 3. Check Diarization Status (if enabled)
     if settings.DIARIZATION_ENABLED:
-        if DIARIZATION_AVAILABLE and diarization_service is not None:
-            # Could add a lightweight check on the service instance if needed
+        # Check if the dependency function returned a service instance
+        if diar_service is not None:
+            # Optional: Add a lightweight check, e.g., if pipeline is loaded?
+            # For now, just check if the service instance exists.
             checks["diarization_status"] = "ok"
         else:
             checks["diarization_status"] = "error"
             # Decide if this is critical. Maybe not if transcription still works?
             # For now, let's consider it non-critical for overall health, but log it.
             logger.warning("[Health Check] Diarization enabled but service/dependencies are not available.")
-            # healthy = False # Optional: Make this critical if needed
+            healthy = False # Make this critical as requested
     else:
         checks["diarization_status"] = "disabled"
 
